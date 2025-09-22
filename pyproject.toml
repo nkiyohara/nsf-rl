@@ -1,0 +1,33 @@
+[project]
+name = "nsf-rl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beartype>=0.21.0",
+    "equinox>=0.13.0",
+    "gym-pusht>=0.1.5",
+    "gymnasium>=1.2.0",
+    "jax[cpu]>=0.7.2",
+    "jaxtyping>=0.3.2",
+    "imageio>=2.36.0",
+    "imageio-ffmpeg>=0.5.1",
+    "numpy>=2.2.6",
+    "optax>=0.2.6",
+    "tqdm>=4.67.1",
+    "wandb>=0.21.4",
+    "marimo>=0.15.5",
+    "matplotlib>=3.10.6",
+    "pandas>=2.3.2",
+]
+
+[build-system]
+requires = ["uv_build<0.9"]
+build-backend = "uv_build"
+
+[tool.uv-build]
+package-dir = "src"
+
+[tool.setuptools]
+packages = { find = { where = ["src"], include = ["nsf_rl", "nsf_rl.*"], exclude = ["data*", "videos*", "marimo*"] } }
