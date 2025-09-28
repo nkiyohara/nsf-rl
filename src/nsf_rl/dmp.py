@@ -97,8 +97,8 @@ class PlanarDMP:
         )
 
     # ------------------------------------------------------------------
-    def rollout(self, params: DMPParams) -> tuple[np.ndarray, np.ndarray]:
-        """Generate a sequence of Cartesian targets and their timestamps."""
+    def _rollout_detailed(self, params: DMPParams) -> DMPRollout:
+        """Integrate the DMP and expose the full internal signals."""
         timesteps = max(2, int(np.ceil(params.duration / self.dt)))
         y = params.start.astype(np.float32).copy()
         z = np.zeros_like(y)
@@ -108,6 +108,10 @@ class PlanarDMP:
 
         raw_positions = np.zeros((timesteps, 2), dtype=np.float32)
         raw_positions[0] = params.start
+        velocities = np.zeros((timesteps, 2), dtype=np.float32)
+        forcing_terms = np.zeros((timesteps, 2), dtype=np.float32)
+        phases = np.zeros(timesteps, dtype=np.float32)
+        phases[0] = 1.0
         times = np.arange(timesteps, dtype=np.float32) * self.dt
 
         for i in range(1, timesteps):
@@ -122,9 +126,12 @@ class PlanarDMP:
             z_dot = self._alpha_z * (self._beta_z * (params.goal - y) - z) + forcing
             z = z + z_dot * dt_scaled
             y = y + z * dt_scaled
+            velocities[i] = z.astype(np.float32)
+            forcing_terms[i] = forcing.astype(np.float32)
 
             s = s - self._alpha_s * s * dt_scaled
             s = max(s, 0.0)
+            phases[i] = np.float32(s)
 
             y_clipped = np.clip(y, self.config.workspace_low, self.config.workspace_high)
             raw_positions[i] = y_clipped
@@ -150,7 +157,22 @@ class PlanarDMP:
         positions = np.clip(positions, self.config.workspace_low, self.config.workspace_high)
         positions[0] = params.start
 
-        return positions, times
+        return DMPRollout(
+            positions=positions,
+            velocities=velocities,
+            canonical_phase=phases,
+            forcing=forcing_terms,
+            times=times,
+        )
+
+    def rollout(self, params: DMPParams) -> tuple[np.ndarray, np.ndarray]:
+        """Generate a sequence of Cartesian targets and their timestamps."""
+        rollout = self._rollout_detailed(params)
+        return rollout.positions, rollout.times
+
+    def rollout_detailed(self, params: DMPParams) -> DMPRollout:
+        """Public helper to access the full DMP rollout signals."""
+        return self._rollout_detailed(params)
 
     # ------------------------------------------------------------------
     def condition_vector_size(self) -> int:
@@ -165,3 +187,12 @@ def batch_stack(items: Iterable[np.ndarray]) -> np.ndarray:
 
 
 __all__ = ["PlanarDMP", "DMPConfig", "DMPParams", "batch_stack"]
+@dataclass
+class DMPRollout:
+    """Full state of a planar DMP rollout sampled at self.dt."""
+
+    positions: np.ndarray
+    velocities: np.ndarray
+    canonical_phase: np.ndarray
+    forcing: np.ndarray
+    times: np.ndarray

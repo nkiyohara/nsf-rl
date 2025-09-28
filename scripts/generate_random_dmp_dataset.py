@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 from nsf_rl.dmp import DMPConfig, DMPParams, PlanarDMP
 from nsf_rl.utils.pymunk_compat import ensure_add_collision_handler
@@ -117,15 +118,21 @@ def main() -> None:
 
         dataset: list[dict[str, Any]] = []
 
-        for idx in range(args.num_samples):
+        for idx in tqdm(range(args.num_samples), desc="Generating samples", unit="traj"):
             rollout_seed = int(rng.integers(0, 1_000_000))
             obs, info = env.reset(seed=rollout_seed)
+            obs = np.asarray(obs, dtype=np.float32)
             base_state = info.get("state")
             if base_state is None:
                 base_state = obs
             base_state = np.asarray(base_state, dtype=np.float32)
             start_pixels = np.clip(base_state[:2], PIXEL_LOW, PIXEL_HIGH)
             start_norm = to_normalized(start_pixels)
+
+            reset_info = _serialise_info(info)
+            step_observations: list[np.ndarray] = [obs]
+            step_rewards: list[float] = []
+            step_infos: list[dict[str, Any]] = []
 
             goal_pixels = rng.uniform(PIXEL_LOW, PIXEL_HIGH, size=2).astype(np.float32)
             goal_norm = to_normalized(goal_pixels)
@@ -157,7 +164,12 @@ def main() -> None:
                 damping=2.0 * np.sqrt(stiffness),
             )
 
-            waypoints_norm_full, times_full = dmp.rollout(params)
+            rollout = dmp.rollout_detailed(params)
+            waypoints_norm_full = rollout.positions
+            times_full = rollout.times
+            phase_full = rollout.canonical_phase
+            velocity_full = rollout.velocities
+            forcing_full = rollout.forcing
             waypoints_pixels_full = to_pixels(waypoints_norm_full)
 
             env_indices = np.arange(0, waypoints_pixels_full.shape[0], DMP_DT_SUBSTEPS, dtype=int)
@@ -167,6 +179,9 @@ def main() -> None:
             waypoints_norm = waypoints_norm_full[env_indices]
             waypoints_pixels = waypoints_pixels_full[env_indices]
             times = times_full[env_indices]
+            phase_actions = phase_full[env_indices]
+            velocity_norm = velocity_full[env_indices]
+            forcing_norm = forcing_full[env_indices]
 
             frames: list[np.ndarray] = []
             actions: list[np.ndarray] = []
@@ -177,6 +192,11 @@ def main() -> None:
             for action in waypoints_pixels:
                 obs, reward, terminated, truncated, step_info = env.step(action.astype(np.float32))
                 actions.append(action.astype(np.float32))
+                step_rewards.append(float(reward))
+                obs = np.asarray(obs, dtype=np.float32)
+                step_observations.append(obs)
+                step_info_serialized = _serialise_info(step_info)
+                step_infos.append(step_info_serialized)
                 episode_info = step_info
                 if video_dir is not None and idx < args.video_samples:
                     frame = env.render()
@@ -185,10 +205,29 @@ def main() -> None:
                 if terminated or truncated:
                     break
 
+            num_actions = len(actions)
+            action_times = env_dt * np.arange(num_actions, dtype=np.float32)
+            observation_times = env_dt * np.arange(len(step_observations), dtype=np.float32)
+            phase_observations = np.exp(-dmp.config.alpha_s * observation_times / params.duration).astype(np.float32)
+
+            def _sequence_from_infos(key: str) -> list[Any]:
+                sequence: list[Any] = [reset_info.get(key)]
+                sequence.extend(info.get(key) for info in step_infos)
+                return sequence
+
+            env_pos_agent = _sequence_from_infos("pos_agent")
+            env_vel_agent = _sequence_from_infos("vel_agent")
+            env_block_pose = _sequence_from_infos("block_pose")
+            env_goal_pose = _sequence_from_infos("goal_pose")
+            env_contacts = _sequence_from_infos("n_contacts")
+            env_success = _sequence_from_infos("is_success")
+            env_coverage = _sequence_from_infos("coverage")
+
             sample_entry = {
                 "seed": rollout_seed,
                 "duration": duration,
                 "stiffness": stiffness,
+                "damping": float(params.damping),
                 "weights": weights.tolist(),
                 "start_pixels": start_pixels.tolist(),
                 "start_normalized": start_norm.tolist(),
@@ -196,11 +235,32 @@ def main() -> None:
                 "goal_normalized": goal_norm.tolist(),
                 "dmp_waypoints_pixels": waypoints_pixels.astype(np.float32).tolist(),
                 "dmp_waypoints_normalized": waypoints_norm.astype(np.float32).tolist(),
+                "dmp_velocity_normalized": velocity_norm.astype(np.float32).tolist(),
+                "dmp_forcing_normalized": forcing_norm.astype(np.float32).tolist(),
+                "dmp_canonical_phase_actions": phase_actions.astype(np.float32).tolist(),
+                "dmp_canonical_phase_observations": phase_observations.tolist(),
+                "dmp_dt": float(dmp.dt),
+                "dmp_alpha_s": float(dmp.config.alpha_s),
+                "dmp_n_basis": int(dmp.config.n_basis),
                 "timestamps": times.astype(np.float32).tolist(),
                 "executed_steps": len(actions),
                 "terminated": bool(terminated),
                 "truncated": bool(truncated),
                 "env_info": _serialise_info(episode_info),
+                "reset_info": reset_info,
+                "executed_actions_pixels": np.asarray(actions, dtype=np.float32).tolist(),
+                "executed_action_timestamps": action_times.tolist(),
+                "observations": np.asarray(step_observations, dtype=np.float32).tolist(),
+                "observation_timestamps": observation_times.tolist(),
+                "rewards": step_rewards,
+                "step_infos": step_infos,
+                "env_pos_agent": env_pos_agent,
+                "env_vel_agent": env_vel_agent,
+                "env_block_pose": env_block_pose,
+                "env_goal_pose": env_goal_pose,
+                "env_n_contacts": env_contacts,
+                "env_is_success": env_success,
+                "env_coverage": env_coverage,
             }
 
             if video_dir is not None and idx < args.video_samples and frames:
