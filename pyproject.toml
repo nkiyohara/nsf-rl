@@ -20,6 +20,7 @@ dependencies = [
     "matplotlib>=3.10.6",
     "pandas>=2.3.2",
     "marimo>=0.16.2",
+    "h5py>=3.14.0",
 ]
 
 [build-system]
