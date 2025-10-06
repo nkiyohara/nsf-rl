@@ -145,6 +145,10 @@ def main() -> None:
         args.output_h5.parent.mkdir(parents=True, exist_ok=True)
         json_dtype = h5py.string_dtype(encoding="utf-8")
 
+        rendered_videos: list[tuple[int, Path]] = []
+        combined_fps: float | None = None
+        combined_written = False
+
         with h5py.File(args.output_h5, "w") as dataset_file:
             dataset_file.attrs["num_samples"] = int(args.num_samples)
             dataset_file.attrs["seed"] = int(args.seed)
@@ -153,6 +157,36 @@ def main() -> None:
             dataset_file.attrs["video_limit"] = int(video_limit)
             if video_dir is not None:
                 dataset_file.attrs["video_directory"] = str(video_dir)
+
+            def write_combined_video() -> None:
+                nonlocal combined_written
+                if combined_written:
+                    return
+                if (
+                    video_dir is None
+                    or combined_fps is None
+                    or not rendered_videos
+                    or video_limit <= 0
+                    or len(rendered_videos) < video_limit
+                ):
+                    return
+                combined_sequence = sorted(rendered_videos, key=lambda item: item[0])
+                first_idx = combined_sequence[0][0] + 1
+                last_idx = combined_sequence[-1][0] + 1
+                combined_name = f"samples_{first_idx:03d}-{last_idx:03d}.mp4"
+                combined_path = video_dir / combined_name
+                with imageio.get_writer(
+                    combined_path,
+                    format="FFMPEG",
+                    mode="I",
+                    fps=combined_fps,
+                ) as writer:
+                    for _, path in combined_sequence:
+                        with imageio.get_reader(path, format="FFMPEG") as reader:
+                            for frame in reader:
+                                writer.append_data(frame)
+                dataset_file.attrs["combined_video_path"] = str(combined_path)
+                combined_written = True
 
             for idx in tqdm(range(args.num_samples), desc="Generating samples", unit="traj"):
                 rollout_seed = int(rng.integers(0, 1_000_000))
@@ -322,6 +356,13 @@ def main() -> None:
                         for frame in frames:
                             writer.append_data(frame)
                     sample_group.attrs["video_path"] = str(video_path)
+                    rendered_videos.append((idx, video_path))
+                    if combined_fps is None:
+                        combined_fps = float(fps)
+                    write_combined_video()
+
+            if not combined_written:
+                write_combined_video()
     finally:
         env.close()
 
