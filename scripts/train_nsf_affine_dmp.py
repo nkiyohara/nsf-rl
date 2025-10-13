@@ -244,9 +244,17 @@ def train(cfg: TrainConfig):
         flow_params, aux_params = eqx.apply_updates(params_tuple, updates)
         return flow_params, aux_params, opt_state, metrics
 
+    @eqx.filter_jit
+    def eval_step(flow_params, aux_params, batch, key):
+        fm = eqx.combine(flow_params, flow_model)
+        am = eqx.combine(aux_params, aux_model)
+        nll = nll_loss(fm, batch).mean()
+        flow_data, _, _ = compute_flow_losses(fm, am, batch, key, cfg.flow_1_2_weight, cfg.flow_2_1_weight)
+        return nll, flow_data.mean()
+
     best_val = float("inf")
 
-    def run_epoch(root: Path, is_train: bool, epoch: int):
+    def run_epoch(root: Path, is_train: bool, epoch: int, epoch_bar=None):
         nonlocal params, aux_params, opt_state
         ds = train_ds if is_train else val_ds
         it = ds.batches(batch_size=cfg.batch_size, repeat=True)
@@ -256,18 +264,17 @@ def train(cfg: TrainConfig):
         if not is_train:
             key_epoch = jax.random.fold_in(key_epoch, 1)
         metrics_sum = None
-        for step in tqdm(range(steps), total=steps, desc=("train" if is_train else "val") + f" {epoch}", leave=False):
+        for step in range(steps):
             batch = _as_batch_dict(next(it))
             k = jax.random.fold_in(key_epoch, step)
+            if epoch_bar is not None:
+                phase = "train" if is_train else "val"
+                epoch_bar.set_postfix_str(f"{phase} {step + 1}/{steps}", refresh=True)
             if is_train:
                 params, aux_params, opt_state, metrics = train_step(params, aux_params, opt_state, batch, k)
             else:
                 # eval: no opt step
-                fm = eqx.combine(params, flow_model)
-                am = eqx.combine(aux_params, aux_model)
-                nll = nll_loss(fm, batch).mean()
-                flow_data, _, _ = compute_flow_losses(fm, am, batch, k, cfg.flow_1_2_weight, cfg.flow_2_1_weight)
-                flow_data = flow_data.mean()
+                nll, flow_data = eval_step(params, aux_params, batch, k)
                 metrics = {"nll": nll, "flow_data": flow_data, "flow_sampled": jnp.array(0.0), "total": nll + cfg.flow_loss_data_weight * flow_data}
             if metrics_sum is None:
                 metrics_sum = {k: jnp.array(v) for k, v in metrics.items()}
@@ -276,16 +283,18 @@ def train(cfg: TrainConfig):
                     metrics_sum[k2] = metrics_sum[k2] + jnp.array(v2)
         # average
         metrics_avg = {k: float(v / steps) for k, v in metrics_sum.items()}
-        # log
+        # log (no console prints)
         split = "train" if is_train else "val"
-        print(f"epoch {epoch} {split}: ", {k: round(v, 4) for k, v in metrics_avg.items()})
         if run is not None:
             run.log({f"{split}/{k}": v for k, v in metrics_avg.items()}, step=epoch)
         return metrics_avg
 
-    for epoch in range(1, cfg.epochs + 1):
-        run_epoch(train_root, True, epoch)
-        val_metrics = run_epoch(val_root, False, epoch)
+    epoch_bar = tqdm(range(1, cfg.epochs + 1), total=cfg.epochs, desc="Epochs", dynamic_ncols=True)
+    for epoch in epoch_bar:
+        epoch_bar.set_postfix_str("train 0/?", refresh=True)
+        run_epoch(train_root, True, epoch, epoch_bar)
+        epoch_bar.set_postfix_str("val 0/?", refresh=True)
+        val_metrics = run_epoch(val_root, False, epoch, epoch_bar)
         val_total = val_metrics.get("total", val_metrics.get("nll", 0.0))
         # checkpoint
         eqx.tree_serialise_leaves(checkpoint_dir / "latest.eqx", (params, aux_params))
