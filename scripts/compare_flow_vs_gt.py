@@ -3,18 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable, Tuple
+from typing import Any, Tuple
 
 import equinox as eqx
 import imageio.v2 as imageio
+from PIL import Image
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 import gymnasium as gym
 import gym_pusht  # noqa: F401
+from nsf_rl.utils.pymunk_compat import ensure_add_collision_handler
 
 from nsf_rl.models.conditional_flow import (
     ConditionalNeuralStochasticFlow,
@@ -76,25 +77,16 @@ def _draw_line(img: np.ndarray, p0: Tuple[int, int], p1: Tuple[int, int], color:
             y0 += sy
 
 
-def _render_prediction_frame(pred_state: np.ndarray, goal_pixels: np.ndarray, canvas_size: int = 512) -> np.ndarray:
+def _render_prediction_frame_with_env(env_pred, pred_state: np.ndarray, goal_pose: np.ndarray) -> np.ndarray:
     # pred_state: [7] = [agent_x, agent_y, block_x, block_y, sin, cos, phase] in normalized space
     agent_xy = _to_pixels(pred_state[:2])
     block_xy = _to_pixels(pred_state[2:4])
     sin_t, cos_t = float(pred_state[4]), float(pred_state[5])
-    theta = np.arctan2(sin_t, cos_t)
-    img = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
-    # Agent: blue circle
-    _draw_circle(img, (int(agent_xy[0]), int(agent_xy[1])), radius=6, color=(40, 120, 240))
-    # Block: green square with heading
-    _draw_square(img, (int(block_xy[0]), int(block_xy[1])), size=16, color=(40, 200, 40))
-    hx = int(block_xy[0] + 12 * np.cos(theta))
-    hy = int(block_xy[1] + 12 * np.sin(theta))
-    _draw_line(img, (int(block_xy[0]), int(block_xy[1])), (hx, hy), color=(0, 0, 0))
-    # Goal: red crosshair
-    gx, gy = int(goal_pixels[0]), int(goal_pixels[1])
-    _draw_line(img, (gx - 8, gy), (gx + 8, gy), color=(220, 40, 40))
-    _draw_line(img, (gx, gy - 8), (gx, gy + 8), color=(220, 40, 40))
-    return img
+    theta = float(np.arctan2(sin_t, cos_t))
+    env_pred.unwrapped.goal_pose = np.asarray(goal_pose, dtype=np.float32)
+    env_pred.unwrapped._set_state(np.array([agent_xy[0], agent_xy[1], block_xy[0], block_xy[1], theta], dtype=np.float32))
+    frame = env_pred.render()
+    return np.asarray(frame)
 
 
 def _load_meta_and_infos(root: Path, meta: dict) -> tuple[dict[str, Any], dict[str, Any], np.ndarray, np.ndarray]:
@@ -160,7 +152,7 @@ def _predict_states_for_times(
     # Prepare batched inputs
     B = int(times.shape[0])
     x_init = jnp.repeat(jnp.asarray(x0)[None, :], B, axis=0)
-    t_init = jnp.zeros((B,), dtype=jnp.float32)
+    # initial time is fixed at 0.0 for all predictions
     t_final = jnp.asarray(times, dtype=jnp.float32)
     condition = jnp.repeat(jnp.asarray(condition_vec)[None, :], B, axis=0)
 
@@ -201,8 +193,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-split", type=str, default="test")
     p.add_argument("--checkpoint-dir", type=Path, required=True)
     p.add_argument("--use-best", action="store_true", help="Load best.eqx instead of latest.eqx")
+    p.add_argument("--epoch-number", type=int, default=None, help="Load epoch_XXX.eqx for a specific epoch number")
     p.add_argument("--num-trajs", type=int, default=10)
-    p.add_argument("--output-dir", type=Path, default=Path("videos/compare_flow_predictions"))
+    p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--fps", type=int, default=10)
     return p.parse_args()
 
@@ -212,7 +205,7 @@ def main() -> None:
 
     # Load index and pick first N metas from test split
     test_root = args.data_root / args.test_split
-    index = [json.loads(l) for l in (test_root / "index.jsonl").open()]
+    index = [json.loads(line) for line in (test_root / "index.jsonl").open()]
     metas = index[: max(0, args.num_trajs)]
     if not metas:
         raise SystemExit("No trajectories in test split")
@@ -231,7 +224,10 @@ def main() -> None:
     model = build_flow_model(state_dim=state_dim, condition_dim=condition_dim, key=jax.random.PRNGKey(0))
 
     # Load parameters
-    params_path = args.checkpoint_dir / ("best.eqx" if args.use_best else "latest.eqx")
+    if args.epoch_number is not None:
+        params_path = args.checkpoint_dir / f"epoch_{args.epoch_number:03d}.eqx"
+    else:
+        params_path = args.checkpoint_dir / ("best.eqx" if args.use_best else "latest.eqx")
     if not params_path.exists():
         raise SystemExit(f"Missing checkpoint: {params_path}")
     params = eqx.tree_deserialise_leaves(params_path, eqx.filter(model, eqx.is_array))
@@ -240,18 +236,26 @@ def main() -> None:
     stats_path = args.checkpoint_dir / "condition_stats.json"
     stats = _load_condition_stats(stats_path)
 
-    # Prepare env for GT rendering
+    # Prepare envs for GT and prediction rendering (use identical renderer)
+    ensure_add_collision_handler()
     env = gym.make("gym_pusht/PushT-v0", render_mode="rgb_array")
+    env_pred = gym.make("gym_pusht/PushT-v0", render_mode="rgb_array")
+    # Determine default output directory if not provided
+    if args.epoch_number is not None:
+        epoch_tag = f"epoch-{args.epoch_number:03d}"
+    else:
+        epoch_tag = "epoch-best" if args.use_best else "epoch-latest"
+    output_dir = args.output_dir if args.output_dir is not None else Path("videos") / args.checkpoint_dir.name / epoch_tag
     fps = args.fps
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Track rendered videos for optional combined output
+    rendered_videos: list[Path] = []
     try:
         for idx, meta in enumerate(metas):
             # Load meta + infos + time/phase
             meta, infos, times, phase = _load_meta_and_infos(test_root, meta)
             reset_info = infos["reset_info"]
-            step_infos = infos["step_infos"]
-            T = len(times) - 1
             # Ground-truth rollout frames by replaying stored actions
             with np.load(test_root / meta["path"]) as npz:
                 actions = np.asarray(npz["act"], dtype=np.float32)
@@ -277,30 +281,62 @@ def main() -> None:
                 cond = stats.apply(cond)
             # Predict states for each time using one-shot from t=0
             preds = _predict_states_for_times(flow_model=model, params=params, x0=x0, times=times, condition_vec=cond)
-            # Render predicted frames on blank canvas, using meta goal for overlay
-            goal_pixels = np.asarray(meta["goal_pixels"], dtype=np.float32)
+            # Render predicted frames using a second env with identical visuals
+            goal_pose = np.asarray(infos.get("goal_pose", [256.0, 256.0, 0.0]), dtype=np.float32)
+            # Ensure prediction env is initialized for this trajectory
+            env_pred.reset(seed=int(meta.get("seed", 0)))
             pred_frames: list[np.ndarray] = []
-            # We skip t=0 for visual comparison to align with env step frames (length T)
             for t in range(1, len(times)):
-                frame_pred = _render_prediction_frame(preds[t], goal_pixels, canvas_size=512)
+                frame_pred = _render_prediction_frame_with_env(env_pred, preds[t], goal_pose)
                 pred_frames.append(frame_pred)
             # Align lengths
             L = min(len(gt_frames), len(pred_frames))
             gt_frames = gt_frames[:L]
             pred_frames = pred_frames[:L]
-            # Concatenate side-by-side
-            side_by_side = [np.concatenate([gt, pred], axis=1) for gt, pred in zip(gt_frames, pred_frames)]
+            # Concatenate side-by-side (resize prediction to match GT height)
+            side_by_side: list[np.ndarray] = []
+            for gt, pred in zip(gt_frames, pred_frames):
+                if gt.shape[0] != pred.shape[0]:
+                    new_h = int(gt.shape[0])
+                    new_w = int(round(pred.shape[1] * (new_h / pred.shape[0])))
+                    pred = np.asarray(Image.fromarray(pred).resize((new_w, new_h), Image.BILINEAR))
+                side_by_side.append(np.concatenate([gt, pred], axis=1))
             # Write video
-            out_path = args.output_dir / f"compare_{idx:03d}.mp4"
+            out_path = output_dir / f"sample_{idx:03d}.mp4"
             with imageio.get_writer(out_path, format="FFMPEG", mode="I", fps=fps) as writer:
                 for fr in side_by_side:
                     writer.append_data(fr)
             print(f"Wrote {out_path}")
+            rendered_videos.append(out_path)
     finally:
         env.close()
+        env_pred.close()
+
+    # Write combined video if any were rendered
+    if rendered_videos:
+        combined_sequence = sorted(rendered_videos)
+        # Determine index range from filenames sample_XXX.mp4
+        def _extract_idx(p: Path) -> int:
+            try:
+                stem = p.stem  # sample_XXX
+                return int(stem.split("_")[1])
+            except Exception:
+                return 0
+        combined_sequence.sort(key=_extract_idx)
+        first_idx = _extract_idx(combined_sequence[0]) + 1
+        last_idx = _extract_idx(combined_sequence[-1]) + 1
+        combined_name = f"samples_{first_idx:03d}-{last_idx:03d}.mp4"
+        combined_path = output_dir / combined_name
+        with imageio.get_writer(combined_path, format="FFMPEG", mode="I", fps=fps) as writer:
+            for path in combined_sequence:
+                with imageio.get_reader(path, format="FFMPEG") as reader:
+                    for frame in reader:
+                        writer.append_data(frame)
+        print(f"Wrote {combined_path}")
 
 
 if __name__ == "__main__":
     main()
+
 
 

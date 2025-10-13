@@ -39,6 +39,9 @@ uv run -- python scripts/compare_flow_vs_gt.py \
   --fps 10
 ```
 
+Additional options:
+- `--epoch-number N`: load `epoch_NNN.eqx` instead of `best/latest`.
+
 ### Script location
 - `scripts/compare_flow_vs_gt.py`
 
@@ -46,9 +49,10 @@ uv run -- python scripts/compare_flow_vs_gt.py \
 - `--data-root`: Root directory of the dataset (default: `data/random_dmp_npz`).
 - `--test-split`: Name of the test split directory (default: `test`).
 - `--checkpoint-dir`: Directory containing NSF checkpoints and condition stats (required).
-- `--use-best`: Load `best.eqx` instead of `latest.eqx`.
+- `--use-best`: Load `best.eqx` instead of `latest.eqx`).
+- `--epoch-number`: Load `epoch_XXX.eqx` for a specific epoch.
 - `--num-trajs`: Number of trajectories to render (default: 10).
-- `--output-dir`: Directory to write comparison MP4 files (default: `videos/compare_flow_predictions`).
+- `--output-dir`: Directory to write comparison MP4 files (default: `videos/<checkpoint_name>/<epoch-tag>` if omitted).
 - `--fps`: Frames per second for output videos (default: 10).
 
 ### Output
@@ -61,5 +65,6 @@ uv run -- python scripts/compare_flow_vs_gt.py \
   - State (7D): `[pos_agent_x, pos_agent_y, block_x, block_y, sin(theta), cos(theta), phase]` in normalized coordinates.
   - Condition: DMP hyperparameters + start/goal (normalized) + flattened weight matrix; standardized with train-split stats if available.
 - If you used non-default model hyperparameters during training, ensure the script reconstructs the same architecture before deserializing parameters.
+
 
 

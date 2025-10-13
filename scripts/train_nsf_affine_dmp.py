@@ -55,6 +55,7 @@ class TrainConfig:
     flow_1_2_weight: float = 1.0
     flow_2_1_weight: float = 1.0
     t_max_flow: Optional[float] = None
+    eps: float = 1e-6
     # normalization
     standardize_condition: bool = True
     # logging
@@ -62,6 +63,7 @@ class TrainConfig:
     wandb_project: Optional[str] = "NSF-PushT"
     wandb_entity: Optional[str] = None
     run_name: Optional[str] = None
+    checkpoint_interval: int = 50
 
 
 def build_models(*, state_dim: int, condition_dim: int, cfg: TrainConfig, key: jax.Array):
@@ -205,14 +207,25 @@ def train(cfg: TrainConfig):
         # data times flow loss
         flow_data, l12d, l21d = compute_flow_losses(fm, am, batch, key, cfg.flow_1_2_weight, cfg.flow_2_1_weight)
         flow_data = flow_data.mean()
-        # sampled times flow loss
-        # sample t_init_flow, t_final_flow, t_middle_flow uniformly over [0, time[-1]] for each sample
-        t0 = jnp.zeros_like(batch["t_init"]) 
-        tT = batch["t_final"].max()  # coarse upper bound per-batch
+        # sampled times flow loss (autonomous): introduce eps margins to avoid degeneracy
+        # t_init fixed at 0, sample t_final in [3*eps, tT], t_middle in [eps, t_final - eps]
+        t0 = jnp.zeros_like(batch["t_init"])  
+        tT_batch = batch["t_final"].max()  # coarse upper bound per-batch
+        tT = jnp.minimum(tT_batch, jnp.array(cfg.t_max_flow)) if cfg.t_max_flow is not None else tT_batch
         key_s = jax.random.split(key, 3)
-        t_init_flow = jax.random.uniform(key_s[0], shape=batch["t_init"].shape, minval=t0, maxval=tT)
-        t_final_flow = jax.random.uniform(key_s[1], shape=batch["t_final"].shape, minval=t_init_flow, maxval=tT)
-        t_middle_flow = jax.random.uniform(key_s[2], shape=batch["t_final"].shape, minval=t_init_flow, maxval=t_final_flow)
+        t_init_flow = t0
+        t_final_flow = jax.random.uniform(
+            key_s[1],
+            shape=batch["t_final"].shape,
+            minval=t_init_flow + 3.0 * cfg.eps,
+            maxval=tT,
+        )
+        t_middle_flow = jax.random.uniform(
+            key_s[2],
+            shape=batch["t_final"].shape,
+            minval=t_init_flow + cfg.eps,
+            maxval=t_final_flow - cfg.eps,
+        )
         batch_flow = {
             "x_init": batch["x_init"],
             "x_final": batch["x_final"],
@@ -301,6 +314,9 @@ def train(cfg: TrainConfig):
         if val_total < best_val:
             best_val = val_total
             eqx.tree_serialise_leaves(checkpoint_dir / "best.eqx", (params, aux_params))
+        # periodic checkpoints every N epochs (default: 50)
+        if cfg.checkpoint_interval and (epoch % cfg.checkpoint_interval == 0):
+            eqx.tree_serialise_leaves(checkpoint_dir / f"epoch_{epoch:03d}.eqx", (params, aux_params))
 
 
 def parse_args() -> TrainConfig:
@@ -326,6 +342,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--flow-1-2-weight", type=float, default=None)
     p.add_argument("--flow-2-1-weight", type=float, default=None)
     p.add_argument("--t-max-flow", type=float, default=None)
+    p.add_argument("--eps", type=float, default=None)
     p.add_argument("--standardize-condition", dest="standardize_condition", action="store_true")
     p.add_argument("--no-standardize-condition", dest="standardize_condition", action="store_false")
     p.set_defaults(standardize_condition=None)
@@ -333,6 +350,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--wandb-project", type=str, default=None)
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--run-name", type=str, default=None)
+    p.add_argument("--checkpoint-interval", type=int, default=None)
     args = p.parse_args()
 
     cfg = TrainConfig()
@@ -377,6 +395,8 @@ def parse_args() -> TrainConfig:
         cfg.flow_2_1_weight = args.flow_2_1_weight
     if args.t_max_flow is not None:
         cfg.t_max_flow = args.t_max_flow
+    if args.eps is not None:
+        cfg.eps = args.eps
     if args.standardize_condition is not None:
         cfg.standardize_condition = args.standardize_condition
     if args.checkpoint_dir is not None:
@@ -387,6 +407,8 @@ def parse_args() -> TrainConfig:
         cfg.wandb_entity = args.wandb_entity
     if args.run_name is not None:
         cfg.run_name = args.run_name
+    if args.checkpoint_interval is not None:
+        cfg.checkpoint_interval = args.checkpoint_interval
 
     return cfg
 
