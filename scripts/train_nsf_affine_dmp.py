@@ -33,7 +33,7 @@ def _safe_import_wandb():
 
 @dataclass
 class TrainConfig:
-    data_root: Path
+    data_root: Path = Path("data/random_dmp_npz")
     train_split: str = "train"
     val_split: str = "validation"
     batch_size: int = 256
@@ -58,8 +58,8 @@ class TrainConfig:
     # normalization
     standardize_condition: bool = True
     # logging
-    checkpoint_dir: Path = Path("models/nsf_affine_dmp")
-    wandb_project: Optional[str] = None
+    checkpoint_dir: Optional[Path] = None
+    wandb_project: Optional[str] = "NSF-PushT"
     wandb_entity: Optional[str] = None
     run_name: Optional[str] = None
 
@@ -148,14 +148,11 @@ def train(cfg: TrainConfig):
     key = jax.random.PRNGKey(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    # Data
+    # Data (created early to determine dims; stats written later after checkpoint_dir is decided)
     train_root = cfg.data_root / cfg.train_split
     val_root = cfg.data_root / cfg.val_split
-    stats_path = cfg.checkpoint_dir / "condition_stats.json"
-    train_ds = DmpPairwiseDataset(root=train_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
-    val_ds = DmpPairwiseDataset(root=val_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
-    if cfg.standardize_condition:
-        train_ds.compute_condition_stats()
+    train_ds = DmpPairwiseDataset(root=train_root, rng=rng, standardize=cfg.standardize_condition, stats_path=None)
+    val_ds = DmpPairwiseDataset(root=val_root, rng=rng, standardize=cfg.standardize_condition, stats_path=None)
 
     # Inspect dims to build models
     # Peek one batch
@@ -171,12 +168,33 @@ def train(cfg: TrainConfig):
     optim = optax.chain(optax.clip_by_global_norm(cfg.grad_clip), optax.adam(cfg.lr))
     opt_state = optim.init((params, aux_params))
 
-    # WandB
+    # WandB (now have dims for config)
     wandb = _safe_import_wandb()
     if cfg.wandb_project and wandb is not None:
         run = wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity, name=cfg.run_name, config={**asdict(cfg), "state_dim": state_dim, "condition_dim": condition_dim})
     else:
         run = None
+
+    # Checkpoint directory policy (after run is available)
+    if cfg.checkpoint_dir is None:
+        if run is not None and hasattr(run, "name") and run.name:
+            checkpoint_dir = Path("models") / str(run.name)
+        else:
+            checkpoint_dir = Path("models") / "local_run"
+    else:
+        checkpoint_dir = cfg.checkpoint_dir
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Recreate datasets with stats_path tied to checkpoint_dir and compute stats if requested
+    stats_path = checkpoint_dir / "condition_stats.json"
+    train_ds = DmpPairwiseDataset(root=train_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
+    val_ds = DmpPairwiseDataset(root=val_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
+    if cfg.standardize_condition:
+        # Recompute stats on the final dataset object so they persist under checkpoint_dir
+        train_ds = DmpPairwiseDataset(root=train_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
+        train_ds.compute_condition_stats()
+        # Recreate val_ds to ensure it uses the same stats_path for reading
+        val_ds = DmpPairwiseDataset(root=val_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
 
     @eqx.filter_value_and_grad(has_aux=True)
     def loss_fn(params_tuple, batch, key):
@@ -226,8 +244,6 @@ def train(cfg: TrainConfig):
         flow_params, aux_params = eqx.apply_updates(params_tuple, updates)
         return flow_params, aux_params, opt_state, metrics
 
-    # Checkpoint dir
-    cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
 
     def run_epoch(root: Path, is_train: bool, epoch: int):
@@ -272,69 +288,98 @@ def train(cfg: TrainConfig):
         val_metrics = run_epoch(val_root, False, epoch)
         val_total = val_metrics.get("total", val_metrics.get("nll", 0.0))
         # checkpoint
-        eqx.tree_serialise_leaves(cfg.checkpoint_dir / "latest.eqx", (params, aux_params))
+        eqx.tree_serialise_leaves(checkpoint_dir / "latest.eqx", (params, aux_params))
         if val_total < best_val:
             best_val = val_total
-            eqx.tree_serialise_leaves(cfg.checkpoint_dir / "best.eqx", (params, aux_params))
+            eqx.tree_serialise_leaves(checkpoint_dir / "best.eqx", (params, aux_params))
 
 
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser(description="Train autonomous NSF (affine coupling) on DMP pairs")
-    p.add_argument("--data-root", type=Path, default=Path("data/random_dmp_npz"))
-    p.add_argument("--train-split", type=str, default="train")
-    p.add_argument("--val-split", type=str, default="validation")
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--hidden-size", type=int, default=64)
-    p.add_argument("--depth", type=int, default=2)
-    p.add_argument("--conditioner-hidden-size", type=int, default=64)
-    p.add_argument("--conditioner-depth", type=int, default=2)
-    p.add_argument("--num-flow-layers", type=int, default=4)
-    p.add_argument("--activation", type=str, default="tanh")
-    p.add_argument("--scale-fn", type=str, default="tanh_exp")
-    p.add_argument("--flow-loss-data-weight", type=float, default=0.2)
-    p.add_argument("--flow-loss-sampled-weight", type=float, default=0.2)
-    p.add_argument("--flow-1-2-weight", type=float, default=1.0)
-    p.add_argument("--flow-2-1-weight", type=float, default=1.0)
+    # Use None defaults so TrainConfig() remains the single source of truth.
+    p.add_argument("--data-root", type=Path, default=None)
+    p.add_argument("--train-split", type=str, default=None)
+    p.add_argument("--val-split", type=str, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--grad-clip", type=float, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--hidden-size", type=int, default=None)
+    p.add_argument("--depth", type=int, default=None)
+    p.add_argument("--conditioner-hidden-size", type=int, default=None)
+    p.add_argument("--conditioner-depth", type=int, default=None)
+    p.add_argument("--num-flow-layers", type=int, default=None)
+    p.add_argument("--activation", type=str, default=None)
+    p.add_argument("--scale-fn", type=str, default=None)
+    p.add_argument("--flow-loss-data-weight", type=float, default=None)
+    p.add_argument("--flow-loss-sampled-weight", type=float, default=None)
+    p.add_argument("--flow-1-2-weight", type=float, default=None)
+    p.add_argument("--flow-2-1-weight", type=float, default=None)
     p.add_argument("--t-max-flow", type=float, default=None)
-    p.add_argument("--standardize-condition", action="store_true")
+    p.add_argument("--standardize-condition", dest="standardize_condition", action="store_true")
     p.add_argument("--no-standardize-condition", dest="standardize_condition", action="store_false")
-    p.set_defaults(standardize_condition=True)
-    p.add_argument("--checkpoint-dir", type=Path, default=Path("models/nsf_affine_dmp"))
+    p.set_defaults(standardize_condition=None)
+    p.add_argument("--checkpoint-dir", type=Path, default=None)
     p.add_argument("--wandb-project", type=str, default=None)
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--run-name", type=str, default=None)
     args = p.parse_args()
-    return TrainConfig(
-        data_root=args.data_root,
-        train_split=args.train_split,
-        val_split=args.val_split,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        lr=args.lr,
-        grad_clip=args.grad_clip,
-        seed=args.seed,
-        hidden_size=args.hidden_size,
-        depth=args.depth,
-        conditioner_hidden_size=args.conditioner_hidden_size,
-        conditioner_depth=args.conditioner_depth,
-        num_flow_layers=args.num_flow_layers,
-        activation=args.activation,
-        scale_fn=args.scale_fn,
-        flow_loss_data_weight=args.flow_loss_data_weight,
-        flow_loss_sampled_weight=args.flow_loss_sampled_weight,
-        flow_1_2_weight=args.flow_1_2_weight,
-        flow_2_1_weight=args.flow_2_1_weight,
-        t_max_flow=args.t_max_flow,
-        standardize_condition=args.standardize_condition,
-        checkpoint_dir=args.checkpoint_dir,
-        wandb_project=args.wandb_project,
-        wandb_entity=args.wandb_entity,
-        run_name=args.run_name,
-    )
+
+    cfg = TrainConfig()
+    # Only override fields when CLI provides a non-None value
+    if args.data_root is not None:
+        cfg.data_root = args.data_root
+    if args.train_split is not None:
+        cfg.train_split = args.train_split
+    if args.val_split is not None:
+        cfg.val_split = args.val_split
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.lr is not None:
+        cfg.lr = args.lr
+    if args.grad_clip is not None:
+        cfg.grad_clip = args.grad_clip
+    if args.seed is not None:
+        cfg.seed = args.seed
+    if args.hidden_size is not None:
+        cfg.hidden_size = args.hidden_size
+    if args.depth is not None:
+        cfg.depth = args.depth
+    if args.conditioner_hidden_size is not None:
+        cfg.conditioner_hidden_size = args.conditioner_hidden_size
+    if args.conditioner_depth is not None:
+        cfg.conditioner_depth = args.conditioner_depth
+    if args.num_flow_layers is not None:
+        cfg.num_flow_layers = args.num_flow_layers
+    if args.activation is not None:
+        cfg.activation = args.activation
+    if args.scale_fn is not None:
+        cfg.scale_fn = args.scale_fn
+    if args.flow_loss_data_weight is not None:
+        cfg.flow_loss_data_weight = args.flow_loss_data_weight
+    if args.flow_loss_sampled_weight is not None:
+        cfg.flow_loss_sampled_weight = args.flow_loss_sampled_weight
+    if args.flow_1_2_weight is not None:
+        cfg.flow_1_2_weight = args.flow_1_2_weight
+    if args.flow_2_1_weight is not None:
+        cfg.flow_2_1_weight = args.flow_2_1_weight
+    if args.t_max_flow is not None:
+        cfg.t_max_flow = args.t_max_flow
+    if args.standardize_condition is not None:
+        cfg.standardize_condition = args.standardize_condition
+    if args.checkpoint_dir is not None:
+        cfg.checkpoint_dir = args.checkpoint_dir
+    if args.wandb_project is not None:
+        cfg.wandb_project = args.wandb_project
+    if args.wandb_entity is not None:
+        cfg.wandb_entity = args.wandb_entity
+    if args.run_name is not None:
+        cfg.run_name = args.run_name
+
+    return cfg
 
 
 def main():
