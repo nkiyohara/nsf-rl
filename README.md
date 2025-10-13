@@ -85,7 +85,7 @@ uv run -- python scripts/compare_flow_vs_gt.py \
   --fps 10
 ```
 
-You can also select a specific checkpoint epoch using `--epoch-number 50`. By default, outputs are written to `videos/<checkpoint_name>/<epoch-tag>/`.
+You can also select a specific checkpoint epoch using `--epoch 50`. By default, outputs are written to `videos/<checkpoint_name>/<epoch-tag>/`.
 
 See `docs/compare_flow_vs_gt.md` for options.
 

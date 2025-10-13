@@ -193,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-split", type=str, default="test")
     p.add_argument("--checkpoint-dir", type=Path, required=True)
     p.add_argument("--use-best", action="store_true", help="Load best.eqx instead of latest.eqx")
-    p.add_argument("--epoch-number", type=int, default=None, help="Load epoch_XXX.eqx for a specific epoch number")
+    p.add_argument("--epoch", type=int, default=None, help="Load epoch_XXX.eqx for a specific epoch number")
     p.add_argument("--num-trajs", type=int, default=10)
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--fps", type=int, default=10)
@@ -224,8 +224,8 @@ def main() -> None:
     model = build_flow_model(state_dim=state_dim, condition_dim=condition_dim, key=jax.random.PRNGKey(0))
 
     # Load parameters
-    if args.epoch_number is not None:
-        params_path = args.checkpoint_dir / f"epoch_{args.epoch_number:03d}.eqx"
+    if args.epoch is not None:
+        params_path = args.checkpoint_dir / f"epoch_{args.epoch:03d}.eqx"
     else:
         params_path = args.checkpoint_dir / ("best.eqx" if args.use_best else "latest.eqx")
     if not params_path.exists():
@@ -241,8 +241,8 @@ def main() -> None:
     env = gym.make("gym_pusht/PushT-v0", render_mode="rgb_array")
     env_pred = gym.make("gym_pusht/PushT-v0", render_mode="rgb_array")
     # Determine default output directory if not provided
-    if args.epoch_number is not None:
-        epoch_tag = f"epoch-{args.epoch_number:03d}"
+    if args.epoch is not None:
+        epoch_tag = f"epoch-{args.epoch:03d}"
     else:
         epoch_tag = "epoch-best" if args.use_best else "epoch-latest"
     output_dir = args.output_dir if args.output_dir is not None else Path("videos") / args.checkpoint_dir.name / epoch_tag

@@ -40,7 +40,7 @@ uv run -- python scripts/compare_flow_vs_gt.py \
 ```
 
 Additional options:
-- `--epoch-number N`: load `epoch_NNN.eqx` instead of `best/latest`.
+- `--epoch N`: load `epoch_NNN.eqx` instead of `best/latest`.
 
 ### Script location
 - `scripts/compare_flow_vs_gt.py`
@@ -50,7 +50,7 @@ Additional options:
 - `--test-split`: Name of the test split directory (default: `test`).
 - `--checkpoint-dir`: Directory containing NSF checkpoints and condition stats (required).
 - `--use-best`: Load `best.eqx` instead of `latest.eqx`).
-- `--epoch-number`: Load `epoch_XXX.eqx` for a specific epoch.
+- `--epoch`: Load `epoch_XXX.eqx` for a specific epoch.
 - `--num-trajs`: Number of trajectories to render (default: 10).
 - `--output-dir`: Directory to write comparison MP4 files (default: `videos/<checkpoint_name>/<epoch-tag>` if omitted).
 - `--fps`: Frames per second for output videos (default: 10).
