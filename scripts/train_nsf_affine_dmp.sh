@@ -1,0 +1,17 @@
+uv run train_nsf_affine_dmp.py \
+  --data-root ../data/random_dmp_npz \
+  --train-split train \
+  --val-split validation \
+  --batch-size 256 \
+  --epochs 1000 \
+  --lr 1e-3 \
+  --hidden-size 64 --depth 2 \
+  --conditioner-hidden-size 64 --conditioner-depth 2 \
+  --num-flow-layers 4 \
+  --scale-fn tanh_exp \
+  --flow-loss-data-weight 0.2 \
+  --flow-loss-sampled-weight 0.2 \
+  --flow-1-2-weight 1.0 \
+  --flow-2-1-weight 1.0 \
+  --checkpoint-dir ../models/nsf_affine_dmp \
+  --wandb-project NSF-PushT
