@@ -37,7 +37,7 @@ class TrainConfig:
     train_split: str = "train"
     val_split: str = "validation"
     batch_size: int = 256
-    epochs: int = 100
+    epochs: int = 500
     lr: float = 1e-3
     grad_clip: float = 1.0
     seed: int = 42
