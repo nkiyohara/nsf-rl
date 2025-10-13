@@ -14,33 +14,11 @@ from tqdm import tqdm
 from nsf_rl.dmp import DMPConfig, DMPParams, PlanarDMP
 from nsf_rl.utils.pymunk_compat import ensure_add_collision_handler
 
-try:
-    import h5py
-except ModuleNotFoundError as exc:  # pragma: no cover
-    raise SystemExit(
-        "h5py is required to run this script. Install project dependencies first."
-    ) from exc
+import gymnasium as gym
 
-try:
-    import gymnasium as gym
-except ModuleNotFoundError as exc:  # pragma: no cover - surface nice error for users
-    raise SystemExit(
-        "gymnasium is required to run this script. Install project dependencies first."
-    ) from exc
+import gym_pusht  # noqa: F401
 
-try:
-    import gym_pusht  # noqa: F401  # pylint: disable=unused-import
-except ModuleNotFoundError as exc:  # pragma: no cover
-    raise SystemExit(
-        "gym-pusht is required to run this script. Install project dependencies first."
-    ) from exc
-
-try:
-    import imageio.v2 as imageio
-except ModuleNotFoundError as exc:  # pragma: no cover
-    raise SystemExit(
-        "imageio is required to write videos. Install project dependencies first."
-    ) from exc
+import imageio.v2 as imageio
 
 
 DMP_DT_SUBSTEPS = 8  # Integrate DMP with this many substeps per env control step
@@ -68,10 +46,10 @@ def _pad_frame_to_macro_block(frame: np.ndarray, macro_block: int = 16) -> np.nd
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sample DMP parameters and generate PushT data")
     parser.add_argument(
-        "--output-h5",
+        "--output-dir",
         type=Path,
-        default=Path("data/random_dmp_dataset.h5"),
-        help="Path to write the HDF5 dataset",
+        default=Path("data/random_dmp_npz"),
+        help="Directory to write NPZ samples and index.jsonl",
     )
     parser.add_argument(
         "--video-dir",
@@ -121,6 +99,22 @@ def _serialise_info(info: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def _get_goal_pose_from_info(info: dict[str, Any]) -> np.ndarray | None:
+    """Extract goal pose as a float32 array if present in a serialised info dict.
+
+    The environment is expected to populate `goal_pose` consistently across all
+    steps. If the key is absent, return None.
+    """
+    if "goal_pose" not in info:
+        return None
+    value = info["goal_pose"]
+    try:
+        arr = np.asarray(value, dtype=np.float32)
+    except Exception:
+        return None
+    return arr
+
+
 def main() -> None:
     args = parse_args()
     if args.num_samples <= 0:
@@ -142,52 +136,46 @@ def main() -> None:
         if video_dir is not None:
             video_dir.mkdir(parents=True, exist_ok=True)
 
-        args.output_h5.parent.mkdir(parents=True, exist_ok=True)
-        json_dtype = h5py.string_dtype(encoding="utf-8")
+        # Output directories for NPZ samples and index.jsonl
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        samples_dir = args.output_dir / "samples"
+        samples_dir.mkdir(parents=True, exist_ok=True)
 
         rendered_videos: list[tuple[int, Path]] = []
         combined_fps: float | None = None
         combined_written = False
 
-        with h5py.File(args.output_h5, "w") as dataset_file:
-            dataset_file.attrs["num_samples"] = int(args.num_samples)
-            dataset_file.attrs["seed"] = int(args.seed)
-            dataset_file.attrs["scale_forcing_by_goal_delta"] = bool(args.scale_forcing)
-            dataset_file.attrs["dmp_dt_substeps"] = int(DMP_DT_SUBSTEPS)
-            dataset_file.attrs["video_limit"] = int(video_limit)
-            if video_dir is not None:
-                dataset_file.attrs["video_directory"] = str(video_dir)
+        def write_combined_video() -> None:
+            nonlocal combined_written
+            if combined_written:
+                return
+            if (
+                video_dir is None
+                or combined_fps is None
+                or not rendered_videos
+                or video_limit <= 0
+                or len(rendered_videos) < video_limit
+            ):
+                return
+            combined_sequence = sorted(rendered_videos, key=lambda item: item[0])
+            first_idx = combined_sequence[0][0] + 1
+            last_idx = combined_sequence[-1][0] + 1
+            combined_name = f"samples_{first_idx:03d}-{last_idx:03d}.mp4"
+            combined_path = video_dir / combined_name
+            with imageio.get_writer(
+                combined_path,
+                format="FFMPEG",
+                mode="I",
+                fps=combined_fps,
+            ) as writer:
+                for _, path in combined_sequence:
+                    with imageio.get_reader(path, format="FFMPEG") as reader:
+                        for frame in reader:
+                            writer.append_data(frame)
+            combined_written = True
 
-            def write_combined_video() -> None:
-                nonlocal combined_written
-                if combined_written:
-                    return
-                if (
-                    video_dir is None
-                    or combined_fps is None
-                    or not rendered_videos
-                    or video_limit <= 0
-                    or len(rendered_videos) < video_limit
-                ):
-                    return
-                combined_sequence = sorted(rendered_videos, key=lambda item: item[0])
-                first_idx = combined_sequence[0][0] + 1
-                last_idx = combined_sequence[-1][0] + 1
-                combined_name = f"samples_{first_idx:03d}-{last_idx:03d}.mp4"
-                combined_path = video_dir / combined_name
-                with imageio.get_writer(
-                    combined_path,
-                    format="FFMPEG",
-                    mode="I",
-                    fps=combined_fps,
-                ) as writer:
-                    for _, path in combined_sequence:
-                        with imageio.get_reader(path, format="FFMPEG") as reader:
-                            for frame in reader:
-                                writer.append_data(frame)
-                dataset_file.attrs["combined_video_path"] = str(combined_path)
-                combined_written = True
-
+        index_path = args.output_dir / "index.jsonl"
+        with open(index_path, "w", encoding="utf-8") as index_fh:
             for idx in tqdm(range(args.num_samples), desc="Generating samples", unit="traj"):
                 rollout_seed = int(rng.integers(0, 1_000_000))
                 obs, info = env.reset(seed=rollout_seed)
@@ -236,26 +224,17 @@ def main() -> None:
 
                 rollout = dmp.rollout_detailed(params)
                 waypoints_norm_full = rollout.positions
-                times_full = rollout.times
-                phase_full = rollout.canonical_phase
-                velocity_full = rollout.velocities
-                forcing_full = rollout.forcing
                 waypoints_pixels_full = to_pixels(waypoints_norm_full)
 
                 env_indices = np.arange(0, waypoints_pixels_full.shape[0], DMP_DT_SUBSTEPS, dtype=int)
                 if env_indices.size == 0 or env_indices[-1] != waypoints_pixels_full.shape[0] - 1:
                     env_indices = np.append(env_indices, waypoints_pixels_full.shape[0] - 1)
 
-                waypoints_norm = waypoints_norm_full[env_indices]
                 waypoints_pixels = waypoints_pixels_full[env_indices]
-                times = times_full[env_indices]
-                phase_actions = phase_full[env_indices]
-                velocity_norm = velocity_full[env_indices]
-                forcing_norm = forcing_full[env_indices]
+                # We only need pixel-space waypoints for control
 
                 frames: list[np.ndarray] = []
                 actions: list[np.ndarray] = []
-                episode_info: dict[str, Any] = {}
                 terminated = False
                 truncated = False
 
@@ -267,7 +246,6 @@ def main() -> None:
                     step_observations.append(obs)
                     step_info_serialized = _serialise_info(step_info)
                     step_infos.append(step_info_serialized)
-                    episode_info = step_info
                     if video_dir is not None and idx < video_limit:
                         frame = env.render()
                         if frame is not None:
@@ -277,22 +255,31 @@ def main() -> None:
                         break
 
                 num_actions = len(actions)
-                action_times = env_dt * np.arange(num_actions, dtype=np.float32)
+                # Timestamps and canonical phase aligned with observations (length T+1)
                 observation_times = env_dt * np.arange(len(step_observations), dtype=np.float32)
                 phase_observations = np.exp(
                     -dmp.config.alpha_s * observation_times / params.duration
                 ).astype(np.float32)
+
+                # Verify goal consistency across all steps and save serialised infos to JSON
+                reset_goal = _get_goal_pose_from_info(reset_info)
+                if reset_goal is None:
+                    raise SystemExit(f"reset info for sample {idx} is missing goal_pose")
+                for t, si in enumerate(step_infos):
+                    step_goal = _get_goal_pose_from_info(si)
+                    if step_goal is None:
+                        raise SystemExit(f"step {t} info for sample {idx} is missing goal_pose")
+                    if not np.allclose(step_goal, reset_goal, rtol=1e-5, atol=1e-5):
+                        raise SystemExit(
+                            f"Inconsistent goal_pose at step {t} for sample {idx}: "
+                            f"reset {reset_goal.tolist()} vs step {step_goal.tolist()}"
+                        )
 
                 def _sequence_from_infos(key: str) -> list[Any]:
                     sequence: list[Any] = [reset_info.get(key)]
                     sequence.extend(info.get(key) for info in step_infos)
                     return sequence
 
-                env_pos_agent = _sequence_from_infos("pos_agent")
-                env_vel_agent = _sequence_from_infos("vel_agent")
-                env_block_pose = _sequence_from_infos("block_pose")
-                env_goal_pose = _sequence_from_infos("goal_pose")
-                env_contacts = _sequence_from_infos("n_contacts")
                 env_success = _sequence_from_infos("is_success")
                 env_coverage = _sequence_from_infos("coverage")
 
@@ -301,53 +288,77 @@ def main() -> None:
                     actions_array = np.zeros((0, waypoints_pixels.shape[1]), dtype=np.float32)
 
                 rewards_array = np.asarray(step_rewards, dtype=np.float32)
-                observations_array = np.asarray(step_observations, dtype=np.float32)
-                phase_actions_array = phase_actions.astype(np.float32)
-                phase_observations_array = phase_observations.astype(np.float32)
+                # Minimal arrays only (we no longer persist observations; infos carry the full state)
 
-                sample_group = dataset_file.create_group(f"sample_{idx:05d}")
-                sample_group.attrs["seed"] = int(rollout_seed)
-                sample_group.attrs["duration"] = float(duration)
-                sample_group.attrs["stiffness"] = float(stiffness)
-                sample_group.attrs["damping"] = float(params.damping)
-                sample_group.attrs["terminated"] = bool(terminated)
-                sample_group.attrs["truncated"] = bool(truncated)
-                sample_group.attrs["executed_steps"] = int(len(actions))
+                # Build minimal arrays for NPZ
+                done = np.zeros((num_actions,), dtype=np.bool_)
+                if num_actions > 0:
+                    done[-1] = bool(terminated or truncated)
 
-                sample_group.create_dataset("weights", data=weights, dtype=np.float32)
-                sample_group.create_dataset("start_pixels", data=start_pixels.astype(np.float32))
-                sample_group.create_dataset("start_normalized", data=start_norm.astype(np.float32))
-                sample_group.create_dataset("goal_pixels", data=goal_pixels.astype(np.float32))
-                sample_group.create_dataset("goal_normalized", data=goal_norm.astype(np.float32))
-                sample_group.create_dataset("dmp_waypoints_pixels", data=waypoints_pixels.astype(np.float32))
-                sample_group.create_dataset("dmp_waypoints_normalized", data=waypoints_norm.astype(np.float32))
-                sample_group.create_dataset("dmp_velocity_normalized", data=velocity_norm.astype(np.float32))
-                sample_group.create_dataset("dmp_forcing_normalized", data=forcing_norm.astype(np.float32))
-                sample_group.create_dataset("dmp_canonical_phase_actions", data=phase_actions_array)
-                sample_group.create_dataset("dmp_canonical_phase_observations", data=phase_observations_array)
-                sample_group.create_dataset("timestamps", data=times.astype(np.float32))
-                sample_group.create_dataset("executed_actions_pixels", data=actions_array)
-                sample_group.create_dataset("executed_action_timestamps", data=action_times.astype(np.float32))
-                sample_group.create_dataset("observations", data=observations_array)
-                sample_group.create_dataset("observation_timestamps", data=observation_times.astype(np.float32))
-                sample_group.create_dataset("rewards", data=rewards_array)
+                sample_name = f"{idx:06d}.npz"
+                sample_rel_path = f"samples/{sample_name}"
+                sample_path = samples_dir / sample_name
+                sample_info_name = f"{idx:06d}.json"
+                sample_info_rel_path = f"samples/{sample_info_name}"
+                sample_info_path = samples_dir / sample_info_name
 
-                sample_group.create_dataset("reset_info", data=json.dumps(reset_info), dtype=json_dtype)
-                sample_group.create_dataset(
-                    "env_info", data=json.dumps(_serialise_info(episode_info)), dtype=json_dtype
+                np.savez_compressed(
+                    sample_path,
+                    act=actions_array,
+                    rew=rewards_array,
+                    done=done,
+                    phase=phase_observations,
+                    time=observation_times,
                 )
-                sample_group.create_dataset("step_infos", data=json.dumps(step_infos), dtype=json_dtype)
-                sample_group.create_dataset("env_pos_agent", data=json.dumps(env_pos_agent), dtype=json_dtype)
-                sample_group.create_dataset("env_vel_agent", data=json.dumps(env_vel_agent), dtype=json_dtype)
-                sample_group.create_dataset("env_block_pose", data=json.dumps(env_block_pose), dtype=json_dtype)
-                sample_group.create_dataset("env_goal_pose", data=json.dumps(env_goal_pose), dtype=json_dtype)
-                sample_group.create_dataset("env_n_contacts", data=json.dumps(env_contacts), dtype=json_dtype)
-                sample_group.create_dataset("env_is_success", data=json.dumps(env_success), dtype=json_dtype)
-                sample_group.create_dataset("env_coverage", data=json.dumps(env_coverage), dtype=json_dtype)
 
-                sample_group.attrs["dmp_dt"] = float(dmp.dt)
-                sample_group.attrs["dmp_alpha_s"] = float(dmp.config.alpha_s)
-                sample_group.attrs["dmp_n_basis"] = int(dmp.config.n_basis)
+                # Write per-trajectory infos (reset + per-step) to JSON
+                with open(sample_info_path, "w", encoding="utf-8") as info_fh:
+                    json.dump(
+                        {
+                            "reset_info": reset_info,
+                            "step_infos": step_infos,
+                            "goal_pose": reset_goal.tolist(),
+                        },
+                        info_fh,
+                        ensure_ascii=False,
+                    )
+
+                # Minimal metadata per sample for filtering
+                success_val = env_success[-1] if env_success else None
+                success = bool(success_val) if success_val is not None else False
+                coverage_val = env_coverage[-1] if env_coverage else None
+                try:
+                    coverage = float(coverage_val) if coverage_val is not None else None
+                except Exception:
+                    coverage = None
+
+                index_record = {
+                    "id": int(idx),
+                    "path": sample_rel_path,
+                    "info_path": sample_info_rel_path,
+                    "len": int(num_actions),
+                    "success": bool(success),
+                    # Per-trajectory metadata for filtering/sampling
+                    "seed": int(rollout_seed),
+                    "duration": float(duration),
+                    "stiffness": float(stiffness),
+                    "damping": float(params.damping),
+                    "terminated": bool(terminated),
+                    "truncated": bool(truncated),
+                    # DMP configuration summary
+                    "dmp_dt": float(dmp.dt),
+                    "dmp_alpha_s": float(dmp.config.alpha_s),
+                    "dmp_n_basis": int(dmp.config.n_basis),
+                    "scale_forcing_by_goal_delta": bool(args.scale_forcing),
+                    # Start/goal and weights (small arrays)
+                    "start_pixels": np.asarray(start_pixels, dtype=np.float32).tolist(),
+                    "goal_pixels": np.asarray(goal_pixels, dtype=np.float32).tolist(),
+                    "goal_pose": reset_goal.tolist(),
+                    "weights": np.asarray(weights, dtype=np.float32).tolist(),
+                }
+                if coverage is not None:
+                    index_record["coverage"] = float(coverage)
+                index_fh.write(json.dumps(index_record, ensure_ascii=False) + "\n")
 
                 if video_dir is not None and idx < video_limit and frames:
                     fps = env.metadata.get("render_fps", 10)
@@ -355,7 +366,6 @@ def main() -> None:
                     with imageio.get_writer(video_path, format="FFMPEG", mode="I", fps=fps) as writer:
                         for frame in frames:
                             writer.append_data(frame)
-                    sample_group.attrs["video_path"] = str(video_path)
                     rendered_videos.append((idx, video_path))
                     if combined_fps is None:
                         combined_fps = float(fps)

@@ -9,7 +9,7 @@ dependencies = [
     "equinox>=0.13.0",
     "gym-pusht>=0.1.5",
     "gymnasium>=1.2.0",
-    "jax[cpu]>=0.7.2",
+    "jax[cuda12]>=0.7.2",
     "jaxtyping>=0.3.2",
     "imageio>=2.36.0",
     "imageio-ffmpeg>=0.5.1",
@@ -19,8 +19,7 @@ dependencies = [
     "wandb>=0.21.4",
     "matplotlib>=3.10.6",
     "pandas>=2.3.2",
-    "marimo>=0.16.2",
-    "h5py>=3.14.0",
+    "marimo>=0.16.2"
 ]
 
 [build-system]

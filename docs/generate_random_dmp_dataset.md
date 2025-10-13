@@ -2,12 +2,11 @@
 
 ## Overview
 - Samples Planar DMP configurations and executes them inside the PushT environment to build supervision data for conditional flow models.
-- Records both the intended DMP targets and the full environment interaction (observations, rewards, per-step info) so models can learn from raw rollouts.
+- Records the intended DMP targets and the full environment interaction as rewards and serialised per-step `info` (instead of saving raw observations).
 - Optionally captures rollout videos for quick qualitative inspection. Progress is displayed with `tqdm` to show how many trajectories have finished.
 
 ## Runtime Dependencies
 - `gymnasium` and `gym-pusht` for environment simulation.
-- `h5py` for writing structured HDF5 datasets.
 - `imageio` + `imageio-ffmpeg` for video export when `--video-samples > 0`.
 - `numpy` for sampling and tensor manipulation.
 - `tqdm` for progress bars.
@@ -18,14 +17,14 @@
 uv run -- python scripts/generate_random_dmp_dataset.py \
   --num-samples 1000 \
   --seed 42 \
-  --output-h5 data/random_dmp_dataset.h5 \
+  --output-dir data/random_dmp_npz \
   --video-dir videos/random_dmp_samples \
   --video-samples 10 \
   --scale-forcing
 ```
 
 Argument summary:
-- `--output-h5`: Target HDF5 file (default `data/random_dmp_dataset.h5`). Parent dirs are created automatically.
+- `--output-dir`: Root directory for NPZ samples and `index.jsonl` (default `data/random_dmp_npz`). Subdir `samples/` is created automatically.
 - `--video-dir`: Directory for MP4 rollouts. Only used when `--video-samples > 0`.
 - `--num-samples`: Number of trajectories to generate.
 - `--video-samples`: Number of trajectories that should receive video captures (starting from index 0, capped at 10 inside the script).
@@ -42,56 +41,63 @@ Argument summary:
    - Step the environment with these actions, logging observations, rewards, and `info` dicts frame-by-frame.
    - Serialise reset info and per-step info (agent pose, block pose, goal pose, contacts, success flag, coverage) alongside the DMP signals.
    - Optionally save a video for the first `--video-samples` trajectories (hard-capped at 10 renders).
-3. Write each sample into a dedicated `sample_<idx>` group in the HDF5 file, storing arrays as float32 datasets and nested metadata as UTF-8 JSON blobs or attributes.
+3. Save each trajectory as a compressed NPZ file under `OUTPUT_DIR/samples/{idx:06d}.npz` and append per-trajectory metadata as a single JSON line to `OUTPUT_DIR/index.jsonl`.
 4. Close the environment in a `finally` block.
 
-## Stored Fields per Trajectory
-- **Attributes**
-  - `seed` (int): RNG draw used to reset the environment for this rollout.
-  - `duration` (float): Planned DMP execution time in seconds.
-  - `stiffness` (float): Spring constant passed to the DMP and controller.
-  - `damping` (float): Critical-damping term `2*sqrt(stiffness)` carried with the sample.
-  - `executed_steps` (int): Number of environment steps actually taken before stopping.
-  - `terminated` (bool): Whether the environment emitted a terminal signal.
-  - `truncated` (bool): Whether the rollout ended because of the environment horizon.
-  - `dmp_dt` (float): Integration step used inside the DMP (seconds per sub-step).
-  - `dmp_alpha_s` (float): Canonical system decay parameter from the Planar DMP.
-  - `dmp_n_basis` (int): Number of radial basis functions in the DMP.
-  - `video_path` (str, optional): Absolute path to the per-trajectory MP4 when recorded.
-- **DMP configuration (datasets)**
-  - `weights` (float32[2, 3]): RBF weights for x/y channels, ordered by basis index.
-  - `start_pixels` (float32[2]): Initial planar end-effector location in PushT pixels.
-  - `start_normalized` (float32[2]): Same start position rescaled to the normalized workspace.
-  - `goal_pixels` (float32[2]): Sampled goal position in pixels.
-  - `goal_normalized` (float32[2]): Goal position in normalized coordinates.
-  - `timestamps` (float32[T_dmp]): Absolute times (seconds) for each DMP waypoint kept after sub-sampling to the control frequency.
-- **DMP rollout (datasets)**
-  - `dmp_waypoints_pixels` (float32[T_dmp, 2]): Position targets fed to the environment each control step.
-  - `dmp_waypoints_normalized` (float32[T_dmp, 2]): Same waypoints in normalized space.
-  - `dmp_velocity_normalized` (float32[T_dmp, 2]): Normalized velocity trace emitted by the DMP integrator.
-  - `dmp_forcing_normalized` (float32[T_dmp, 2]): Normalized forcing term after optional goal scaling.
-  - `dmp_canonical_phase_actions` (float32[T_dmp]): Canonical phase values aligned with each control action time.
-  - `dmp_canonical_phase_observations` (float32[T_obs]): Canonical phase evaluated at every observation timestamp (`T_obs = executed_steps + 1`).
-- **Environment rollout (datasets)**
-  - `executed_actions_pixels` (float32[T_env, 2]): Actions actually applied to the environment (`T_env = executed_steps`). Can be shorter than `T_dmp` if the rollout stopped early.
-  - `executed_action_timestamps` (float32[T_env]): Elapsed control times `t = n * env_dt` for each executed action.
-  - `observations` (float32[T_obs, obs_dim]): Observed PushT state sequence starting with the reset state; `obs_dim` is the environment's observation dimensionality.
-  - `observation_timestamps` (float32[T_obs]): Elapsed times sampled at every observation.
-  - `rewards` (float32[T_env]): Step-wise reward signal aligned with executed actions.
-- **Structured metadata (datasets, JSON-encoded UTF-8 strings)**
-  - `reset_info`: Serialized info dict returned by `env.reset()`.
-  - `env_info`: Final info dict observed when the rollout ended (empty if unavailable).
-  - `step_infos`: List of per-step info dicts (`len = T_env`), matching the environment transitions.
-  - `env_pos_agent`: List of agent position entries collected from reset/step infos (`len = T_obs`; entries may be `null` when missing).
-  - `env_vel_agent`: List of agent velocity entries pulled from infos (`len = T_obs`).
-  - `env_block_pose`: List of block pose entries from infos (`len = T_obs`).
-  - `env_goal_pose`: List of goal pose entries from infos (`len = T_obs`).
-  - `env_n_contacts`: List of contact counts from infos (`len = T_obs`).
-  - `env_is_success`: List of success flags from infos (`len = T_obs`).
-  - `env_coverage`: List of coverage metrics from infos (`len = T_obs`).
+## Output Format (Simple, Training-Friendly)
+
+Directory layout
+- `OUTPUT_DIR/index.jsonl`: One JSON object per trajectory (metadata for filtering/sampling)
+- `OUTPUT_DIR/samples/{idx:06d}.npz`: Compressed arrays for the trajectory
+- `OUTPUT_DIR/samples/{idx:06d}.json`: Serialised `info` dicts for reset and each step
+- Optional videos under `VIDEO_DIR/` when `--video-samples > 0` (plus an auto-combined clip)
+
+NPZ contents per trajectory
+- `act`: float32, shape `[T, act_dim]` — executed actions in pixel space
+- `rew`: float32, shape `[T]` — per-step rewards
+- `done`: bool, shape `[T]` — last element True iff terminated or truncated
+- `phase`: float32, shape `[T+1]` — canonical phase `s(t) = exp(-alpha_s * t / duration)` aligned with the reset/steps timeline
+- `time`: float32, shape `[T+1]` — wall-clock times in seconds aligned with observations (`time[0]=0.0`, `time[t+1]=time[t]+env_dt`)
+
+Index JSONL fields per trajectory
+- `id` (int), `path` (str relative to `OUTPUT_DIR`), `info_path` (str), `len` (int = T), `success` (bool)
+- `seed` (int), `duration` (float), `stiffness` (float), `damping` (float)
+- `terminated` (bool), `truncated` (bool)
+- `dmp_dt` (float), `dmp_alpha_s` (float), `dmp_n_basis` (int)
+- `scale_forcing_by_goal_delta` (bool)
+- `start_pixels` (list[2] of float), `goal_pixels` (list[2] of float)
+- `goal_pose` (list[3] of float) — validated constant across all steps
+- `weights` (list[2][n_basis] of float)
+
+Infos JSON contents per trajectory
+- `reset_info`: serialised `info` dict returned by `env.reset(...)`
+- `step_infos`: list of serialised `info` dicts returned by each `env.step(...)`
+
+Consistency guarantee
+- The script validates that `goal_pose` is identical (within 1e-5) across `reset_info` and every element of `step_infos`. If any discrepancy is found, the script terminates with an error for that sample.
+
+Loading examples
+```python
+import json, numpy as np
+from pathlib import Path
+
+root = Path("data/random_dmp_npz/train")
+for line in (root/"index.jsonl").open():
+    meta = json.loads(line)
+    with np.load(root/meta["path"]) as npz:
+        act = npz["act"]; rew = npz["rew"]; done = npz["done"]; phase = npz["phase"]; time = npz["time"]
+    infos = json.loads((root/meta["info_path"]).read_text(encoding="utf-8"))
+    reset_info = infos["reset_info"]
+    step_infos = infos["step_infos"]
+    # filter by meta e.g., stiffness range, success, length, etc.
+```
+
+### What is inside `reset_info` and `step_infos`?
+- These are serialised mirrors of the environment `info` dicts. Typical keys include `pos_agent`, `vel_agent`, `block_pose`, `goal_pose`, `n_contacts`, `is_success`, and possibly `coverage`.
+- Arrays are converted to lists for JSON compatibility.
 
 ## Practical Tips
-- For rapid checks, run with `--num-samples 10 --video-samples 0`; the resulting HDF5 file stays lightweight and skips video encoding.
-- Each trajectory can be streamed directly: `with h5py.File(path) as f: traj = f["sample_00042"]`.
-- Decode any JSON-style dataset with `json.loads(traj["reset_info"][()])` to regain dict structures.
+- For rapid checks, run with `--num-samples 10 --video-samples 0`; this avoids video encoding and writes a small `index.jsonl` with a handful of `.npz` files.
+- Split generation: use `scripts/generate_random_dmp_splits.sh` to create train/validation/test under `data/random_dmp_npz/<split>/`.
+- Filtering is fast by scanning `index.jsonl` first; load only the matching `.npz` files you need for a batch.
 - Video rendering stops after the first ten samples even if `--video-samples` is larger, avoiding runaway encoding time.

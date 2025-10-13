@@ -13,7 +13,7 @@ run_split() {
     local seed="$3"
     local video_samples="$4"
 
-    local output_h5="${ROOT_DIR}/data/random_dmp_${split_name}.h5"
+    local output_dir="${ROOT_DIR}/data/random_dmp_npz/${split_name}"
     local video_dir="${ROOT_DIR}/videos/random_dmp_samples/${split_name}"
 
     echo "[nsf-rl] Generating ${split_name} split (${num_samples} samples, seed ${seed})"
@@ -21,7 +21,7 @@ run_split() {
         --num-samples "${num_samples}" \
         --seed "${seed}" \
         --video-samples "${video_samples}" \
-        --output-h5 "${output_h5}" \
+        --output-dir "${output_dir}" \
         --video-dir "${video_dir}"
 }
 
