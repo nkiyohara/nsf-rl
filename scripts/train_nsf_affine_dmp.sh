@@ -13,5 +13,6 @@ uv run train_nsf_affine_dmp.py \
   --flow-loss-sampled-weight 0.2 \
   --flow-1-2-weight 1.0 \
   --flow-2-1-weight 1.0 \
+  --state-source waypoint \
   --checkpoint-dir ../models/nsf_affine_dmp \
   --wandb-project NSF-PushT

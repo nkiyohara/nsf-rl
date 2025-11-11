@@ -56,6 +56,8 @@ NPZ per trajectory:
 - `done` `[T]` (bool)
 - `phase` `[T+1]` (float32), with `phase[t] = exp(-alpha_s * t / duration)`
 - `time` `[T+1]` (float32), `time[0]=0.0`, step `env_dt`
+- `waypoints_norm` `[T+1, 2]` (float32), DMP targets sampled at env rate in normalized PushT coordinates
+- `waypoint_vel_norm` `[T+1, 2]` (float32), matching velocities (normalized by half-span) for the same samples
 
 Index JSONL fields:
 - `id`, `path`, `info_path`, `len`, `success`, `seed`, `duration`, `stiffness`, `damping`, `terminated`, `truncated`,

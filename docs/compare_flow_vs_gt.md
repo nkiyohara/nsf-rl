@@ -2,6 +2,8 @@
 
 This guide explains how to generate side-by-side videos that compare ground-truth PushT rollouts with predictions from the trained neural stochastic flow (NSF) conditioned on DMP parameters.
 
+> **Note:** This script assumes the NSF was trained with `--state-source env` so the predicted states include agent/block poses and orientation. When training with the default `--state-source waypoint`, use the waypoint visualization script described in the README instead.
+
 ### What it does
 - **Ground truth (left)**: Replays recorded actions from the dataset in `gym_pusht/PushT-v0` and captures rendered frames.
 - **Prediction (right)**: Uses the trained NSF to produce one-shot predictions for arbitrary times from the initial state and the same DMP condition. Frames are rendered on a blank 512×512 canvas with:
@@ -65,6 +67,5 @@ Additional options:
   - State (7D): `[pos_agent_x, pos_agent_y, block_x, block_y, sin(theta), cos(theta), phase]` in normalized coordinates.
   - Condition: DMP hyperparameters + start/goal (normalized) + flattened weight matrix; standardized with train-split stats if available.
 - If you used non-default model hyperparameters during training, ensure the script reconstructs the same architecture before deserializing parameters.
-
 
 

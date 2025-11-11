@@ -62,6 +62,7 @@ uv run -- python scripts/train_nsf_affine_dmp.py \
   --flow-loss-sampled-weight 0.2 \
   --flow-1-2-weight 1.0 \
   --flow-2-1-weight 1.0 \
+  --state-source waypoint \
   --checkpoint-dir models/nsf_affine_dmp \
   --wandb-project NSF-PushT --run-name dmp-nsf-affine
 ```
@@ -88,6 +89,21 @@ uv run -- python scripts/compare_flow_vs_gt.py \
 You can also select a specific checkpoint epoch using `--epoch 50`. By default, outputs are written to `videos/<checkpoint_name>/<epoch-tag>/`.
 
 See `docs/compare_flow_vs_gt.md` for options.
+
+### 4) Visualize waypoint reproduction
+
+```bash
+uv run -- python scripts/visualize_waypoint_predictions.py \
+  --data-root data/random_dmp_npz \
+  --split test \
+  --checkpoint-dir models/nsf_affine_dmp \
+  --use-best \
+  --start-index 0 \
+  --num-samples 5 \
+  --output-dir videos/waypoint_replays
+```
+
+Generates MP4s that overlay the commanded DMP waypoint trajectory (normalized PushT coordinates) and the NSF's predicted path on a 2D canvas, making it easy to verify whether the model tracks the intended command regardless of exact PushT block arrangement.
 
 ## Repo structure
 

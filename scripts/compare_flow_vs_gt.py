@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -184,7 +185,7 @@ def build_flow_model(state_dim: int, condition_dim: int, *, hidden_size: int = 6
         scale_fn=scale_fn,  # type: ignore
         include_initial_time=False,
     )
-    return ConditionalNeuralStochasticFlow(config=cfg, key=key)
+    return ConditionalNeuralStochasticFlow(key=key, **asdict(cfg))
 
 
 def parse_args() -> argparse.Namespace:
@@ -337,6 +338,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 

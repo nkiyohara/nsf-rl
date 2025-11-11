@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -31,13 +31,34 @@ def _safe_import_wandb():
         return None
 
 
+def _to_wandb_safe(obj):
+    """Recursively convert objects to a wandb-serializable form.
+
+    - Convert Path to str
+    - Handle dataclasses, dicts, lists/tuples
+    - Keep primitives and None as-is
+    - Fallback to str for unknown types
+    """
+    if isinstance(obj, Path):
+        return str(obj)
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if is_dataclass(obj):
+        return _to_wandb_safe(asdict(obj))
+    if isinstance(obj, dict):
+        return {k: _to_wandb_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_wandb_safe(v) for v in obj]
+    return str(obj)
+
+
 @dataclass
 class TrainConfig:
     data_root: Path = Path("data/random_dmp_npz")
     train_split: str = "train"
     val_split: str = "validation"
     batch_size: int = 256
-    epochs: int = 500
+    epochs: int = 5000
     lr: float = 1e-3
     grad_clip: float = 1.0
     seed: int = 42
@@ -58,6 +79,7 @@ class TrainConfig:
     eps: float = 1e-6
     # normalization
     standardize_condition: bool = True
+    state_source: str = "waypoint"
     # logging
     checkpoint_dir: Optional[Path] = None
     wandb_project: Optional[str] = "NSF-PushT"
@@ -80,7 +102,7 @@ def build_models(*, state_dim: int, condition_dim: int, cfg: TrainConfig, key: j
         scale_fn=cfg.scale_fn,  # type: ignore
         include_initial_time=False,
     )
-    flow_model = ConditionalNeuralStochasticFlow(config=flow_cfg, key=key_flow)
+    flow_model = ConditionalNeuralStochasticFlow(key=key_flow, **asdict(flow_cfg))
     aux_model = ConditionalAuxiliaryFlow(
         state_dim=state_dim,
         condition_dim=condition_dim,
@@ -153,8 +175,20 @@ def train(cfg: TrainConfig):
     # Data (created early to determine dims; stats written later after checkpoint_dir is decided)
     train_root = cfg.data_root / cfg.train_split
     val_root = cfg.data_root / cfg.val_split
-    train_ds = DmpPairwiseDataset(root=train_root, rng=rng, standardize=cfg.standardize_condition, stats_path=None)
-    val_ds = DmpPairwiseDataset(root=val_root, rng=rng, standardize=cfg.standardize_condition, stats_path=None)
+    train_ds = DmpPairwiseDataset(
+        root=train_root,
+        rng=rng,
+        standardize=cfg.standardize_condition,
+        stats_path=None,
+        state_source=cfg.state_source,
+    )
+    val_ds = DmpPairwiseDataset(
+        root=val_root,
+        rng=rng,
+        standardize=cfg.standardize_condition,
+        stats_path=None,
+        state_source=cfg.state_source,
+    )
 
     # Inspect dims to build models
     # Peek one batch
@@ -173,7 +207,10 @@ def train(cfg: TrainConfig):
     # WandB (now have dims for config)
     wandb = _safe_import_wandb()
     if cfg.wandb_project and wandb is not None:
-        run = wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity, name=cfg.run_name, config={**asdict(cfg), "state_dim": state_dim, "condition_dim": condition_dim})
+        # Serialize full config safely (convert Paths, etc.) and include derived dims
+        full_cfg = {**asdict(cfg), "state_dim": state_dim, "condition_dim": condition_dim}
+        wandb_config = _to_wandb_safe(full_cfg)
+        run = wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity, name=cfg.run_name, config=wandb_config)
     else:
         run = None
 
@@ -189,14 +226,38 @@ def train(cfg: TrainConfig):
 
     # Recreate datasets with stats_path tied to checkpoint_dir and compute stats if requested
     stats_path = checkpoint_dir / "condition_stats.json"
-    train_ds = DmpPairwiseDataset(root=train_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
-    val_ds = DmpPairwiseDataset(root=val_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
+    train_ds = DmpPairwiseDataset(
+        root=train_root,
+        rng=rng,
+        standardize=cfg.standardize_condition,
+        stats_path=stats_path,
+        state_source=cfg.state_source,
+    )
+    val_ds = DmpPairwiseDataset(
+        root=val_root,
+        rng=rng,
+        standardize=cfg.standardize_condition,
+        stats_path=stats_path,
+        state_source=cfg.state_source,
+    )
     if cfg.standardize_condition:
         # Recompute stats on the final dataset object so they persist under checkpoint_dir
-        train_ds = DmpPairwiseDataset(root=train_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
+        train_ds = DmpPairwiseDataset(
+            root=train_root,
+            rng=rng,
+            standardize=cfg.standardize_condition,
+            stats_path=stats_path,
+            state_source=cfg.state_source,
+        )
         train_ds.compute_condition_stats()
         # Recreate val_ds to ensure it uses the same stats_path for reading
-        val_ds = DmpPairwiseDataset(root=val_root, rng=rng, standardize=cfg.standardize_condition, stats_path=stats_path)
+        val_ds = DmpPairwiseDataset(
+            root=val_root,
+            rng=rng,
+            standardize=cfg.standardize_condition,
+            stats_path=stats_path,
+            state_source=cfg.state_source,
+        )
 
     @eqx.filter_value_and_grad(has_aux=True)
     def loss_fn(params_tuple, batch, key):
@@ -346,6 +407,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--standardize-condition", dest="standardize_condition", action="store_true")
     p.add_argument("--no-standardize-condition", dest="standardize_condition", action="store_false")
     p.set_defaults(standardize_condition=None)
+    p.add_argument("--state-source", type=str, choices=("waypoint", "env"), default=None)
     p.add_argument("--checkpoint-dir", type=Path, default=None)
     p.add_argument("--wandb-project", type=str, default=None)
     p.add_argument("--wandb-entity", type=str, default=None)
@@ -399,6 +461,8 @@ def parse_args() -> TrainConfig:
         cfg.eps = args.eps
     if args.standardize_condition is not None:
         cfg.standardize_condition = args.standardize_condition
+    if args.state_source is not None:
+        cfg.state_source = args.state_source
     if args.checkpoint_dir is not None:
         cfg.checkpoint_dir = args.checkpoint_dir
     if args.wandb_project is not None:
@@ -420,5 +484,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

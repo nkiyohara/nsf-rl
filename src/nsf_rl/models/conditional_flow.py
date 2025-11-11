@@ -237,43 +237,57 @@ class ConditionalNeuralStochasticFlow(eqx.Module):
     include_initial_time: bool
     state_dim: int
 
-    def __init__(self, *, config: FlowNetworkConfig, key: PRNGKeyArray) -> None:
-        if config.state_dim <= 0 or config.condition_dim <= 0:
-            raise ValueError("state_dim and condition_dim must be positive in FlowNetworkConfig")
-        activation = _activation(config.activation)
-        key_base, *bijector_keys = jax.random.split(key, config.num_flow_layers + 1)
+    def __init__(
+        self,
+        *,
+        state_dim: int,
+        condition_dim: int,
+        hidden_size: int,
+        depth: int,
+        activation: str,
+        num_flow_layers: int,
+        conditioner_hidden_size: int,
+        conditioner_depth: int,
+        scale_fn: AffineCouplingScaleFn,
+        include_initial_time: bool,
+        key: PRNGKeyArray,
+    ) -> None:
+        if state_dim <= 0 or condition_dim <= 0:
+            raise ValueError("state_dim and condition_dim must be positive")
+        activation_fn = _activation(activation)
+        key_base, *bijector_keys = jax.random.split(key, num_flow_layers + 1)
         self.base = ConditionalGaussianTransition(
-            state_dim=config.state_dim,
-            condition_dim=config.condition_dim,
-            hidden_size=config.hidden_size,
-            depth=config.depth,
-            activation=activation,
-            include_initial_time=config.include_initial_time,
+            state_dim=state_dim,
+            condition_dim=condition_dim,
+            hidden_size=hidden_size,
+            depth=depth,
+            activation=activation_fn,
+            include_initial_time=include_initial_time,
             key=key_base,
         )
-        mask = (jnp.arange(config.state_dim) % 2).astype(jnp.bool_)
+        mask = (jnp.arange(state_dim) % 2).astype(jnp.bool_)
         self.bijectors = []
-        conditioner_dim = config.state_dim + config.condition_dim + 1 + (1 if config.include_initial_time else 0)
+        conditioner_dim = state_dim + condition_dim + 1 + (1 if include_initial_time else 0)
         for k in bijector_keys:
             conditioner = Conditioner(
-                dim=config.state_dim,
+                dim=state_dim,
                 condition_dim=conditioner_dim,
-                width_size=config.conditioner_hidden_size,
-                depth=config.conditioner_depth,
-                activation=activation,
+                width_size=conditioner_hidden_size,
+                depth=conditioner_depth,
+                activation=activation_fn,
                 key=k,
             )
             self.bijectors.append(
                 ContinuousAffineCoupling(
                     mask=mask,
                     conditioner=conditioner,
-                    scale_fn=config.scale_fn,
+                    scale_fn=scale_fn,
                 )
             )
             mask = ~mask
-        self.condition_dim = config.condition_dim
-        self.include_initial_time = config.include_initial_time
-        self.state_dim = config.state_dim
+        self.condition_dim = condition_dim
+        self.include_initial_time = include_initial_time
+        self.state_dim = state_dim
 
     def _flow_condition(
         self,

@@ -82,7 +82,7 @@ def setup_training_state(
     key: jax.Array,
 ) -> TrainState:
     key_model, key_aux = jax.random.split(key, 2)
-    model = ConditionalNeuralStochasticFlow(config=flow_config, key=key_model)
+    model = ConditionalNeuralStochasticFlow(key=key_model, **asdict(flow_config))
     auxiliary = ConditionalAuxiliaryFlow(
         state_dim=dataset.state_dim,
         condition_dim=dataset.condition_dim,

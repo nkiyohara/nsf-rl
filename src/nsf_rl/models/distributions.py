@@ -145,7 +145,7 @@ class ContinuousNormalizingFlow(Distribution):
             z, ldj = bijector.inverse_and_log_det_jacobian(y=z, time_diff=self.time_diff, condition=self.condition)
             log_det += ldj
         base_log_prob = self.base_distribution.log_prob(z)
-        return base_log_prob - log_det
+        return base_log_prob + log_det
 
     def sample_and_log_prob(self, key: PRNGKeyArray) -> tuple[Float[Array, "..."], Float[Array, "..."]]:
         z, base_log_prob = self.base_distribution.sample_and_log_prob(key)
@@ -196,7 +196,7 @@ class NormalizingFlow(Distribution):
             z, ldj = bijector.inverse_and_log_det_jacobian(z, condition=self.condition)
             log_det += ldj
         base_log_prob = self.base_distribution.log_prob(z)
-        return base_log_prob - log_det
+        return base_log_prob + log_det
 
     def sample_and_log_prob(self, key: PRNGKeyArray) -> tuple[Float[Array, "..."], Float[Array, "..."]]:
         z, base_log_prob = self.base_distribution.sample_and_log_prob(key)

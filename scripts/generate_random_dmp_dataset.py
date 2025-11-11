@@ -223,7 +223,8 @@ def main() -> None:
                 )
 
                 rollout = dmp.rollout_detailed(params)
-                waypoints_norm_full = rollout.positions
+                waypoints_norm_full = rollout.positions.astype(np.float32)
+                waypoints_vel_norm_full = rollout.velocities.astype(np.float32)
                 waypoints_pixels_full = to_pixels(waypoints_norm_full)
 
                 env_indices = np.arange(0, waypoints_pixels_full.shape[0], DMP_DT_SUBSTEPS, dtype=int)
@@ -231,7 +232,16 @@ def main() -> None:
                     env_indices = np.append(env_indices, waypoints_pixels_full.shape[0] - 1)
 
                 waypoints_pixels = waypoints_pixels_full[env_indices]
-                # We only need pixel-space waypoints for control
+                waypoints_norm_actions = waypoints_norm_full[env_indices]
+                waypoints_vel_norm_actions = waypoints_vel_norm_full[env_indices]
+
+                def _extend_obs(arr: np.ndarray) -> np.ndarray:
+                    if arr.shape[0] == 0:
+                        return arr
+                    return np.concatenate([arr, arr[-1:]], axis=0)
+
+                waypoints_norm_obs = _extend_obs(waypoints_norm_actions)
+                waypoints_vel_norm_obs = _extend_obs(waypoints_vel_norm_actions)
 
                 frames: list[np.ndarray] = []
                 actions: list[np.ndarray] = []
@@ -260,6 +270,12 @@ def main() -> None:
                 phase_observations = np.exp(
                     -dmp.config.alpha_s * observation_times / params.duration
                 ).astype(np.float32)
+
+                if waypoints_norm_obs.shape[0] != observation_times.shape[0]:
+                    raise RuntimeError(
+                        f"Waypoint sequence length {waypoints_norm_obs.shape[0]} does not match "
+                        f"observation length {observation_times.shape[0]} for sample {idx}"
+                    )
 
                 # Verify goal consistency across all steps and save serialised infos to JSON
                 reset_goal = _get_goal_pose_from_info(reset_info)
@@ -309,6 +325,8 @@ def main() -> None:
                     done=done,
                     phase=phase_observations,
                     time=observation_times,
+                    waypoints_norm=waypoints_norm_obs.astype(np.float32),
+                    waypoint_vel_norm=waypoints_vel_norm_obs.astype(np.float32),
                 )
 
                 # Write per-trajectory infos (reset + per-step) to JSON
