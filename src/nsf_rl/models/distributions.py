@@ -102,6 +102,29 @@ class MultivariateNormalDiag(Distribution):
         )
         return sample, log_prob
 
+    def kl_divergence(self, other: "MultivariateNormalDiag") -> Float[Array, "..."]:
+        """Compute KL(self || other) analytically for two diagonal Gaussians.
+
+        KL(N(μ₁,σ₁²) || N(μ₂,σ₂²)) = 
+            log(σ₂/σ₁) + (σ₁² + (μ₁-μ₂)²)/(2σ₂²) - 1/2
+        
+        Summed over dimensions.
+        """
+        if not isinstance(other, MultivariateNormalDiag):
+            raise TypeError(f"Expected MultivariateNormalDiag, got {type(other)}")
+
+        var_self = self.scale_diag ** 2
+        var_other = other.scale_diag ** 2
+        mean_diff = self.loc - other.loc
+
+        # KL per dimension: log(σ₂/σ₁) + (σ₁² + (μ₁-μ₂)²)/(2σ₂²) - 0.5
+        kl_per_dim = (
+            jnp.log(other.scale_diag) - jnp.log(self.scale_diag)
+            + (var_self + mean_diff ** 2) / (2 * var_other)
+            - 0.5
+        )
+        return jnp.sum(kl_per_dim, axis=self.event_axes)
+
 
 class ContinuousNormalizingFlow(Distribution):
     base_distribution: Distribution
