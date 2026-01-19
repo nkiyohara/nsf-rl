@@ -87,6 +87,7 @@ class TrainConfig:
     encoder_embedding_dim: int = 64
     encoder_hidden_size: int = 64
     encoder_depth: int = 2
+    encoder_type: Literal["mlp", "identity"] = "mlp"
     posterior_type: Literal["mlp", "mlp_residual", "gru"] = "gru"  # GRU for temporal context
     posterior_hidden_size: int = 64
     posterior_depth: int = 2
@@ -108,7 +109,8 @@ class TrainConfig:
 
     # Loss weights
     flow_loss_weight: float = 0.1
-    kl_weight: float = 1.0  # Weight for KL divergence in ELBO
+    kl_weight: float = 1.0  # Target weight for KL divergence
+    kl_anneal_epochs: int = 0  # Number of epochs to anneal KL from 0 to kl_weight
 
     # Normalization
     standardize_condition: bool = True
@@ -137,6 +139,7 @@ def build_model(
         encoder_embedding_dim=cfg.encoder_embedding_dim,
         encoder_hidden_size=cfg.encoder_hidden_size,
         encoder_depth=cfg.encoder_depth,
+        encoder_type=cfg.encoder_type,
         posterior_type=cfg.posterior_type,
         posterior_hidden_size=cfg.posterior_hidden_size,
         posterior_depth=cfg.posterior_depth,
@@ -160,7 +163,7 @@ def build_model(
 def _as_batch_arrays(batch: SequenceBatch) -> dict:
     """Convert SequenceBatch to dictionary of jnp arrays."""
     return {
-        "observations": [jnp.asarray(o) for o in batch.observations],
+        "observations": jnp.asarray(batch.observations),  # [B, T, obs_dim]
         "full_states": jnp.asarray(batch.full_states),
         "times": jnp.asarray(batch.times),
         "condition": jnp.asarray(batch.condition),
@@ -184,31 +187,40 @@ def compute_elbo_loss(
     Returns:
         Tuple of (total_loss, loss_components).
     """
-    observations = batch["observations"]
-    times = batch["times"]
-    condition = batch["condition"]
+    observations = batch["observations"]  # (batch, T, obs_dim)
+    times = batch["times"]  # (batch, T)
+    condition = batch["condition"]  # (batch, condition_dim)
     batch_size = condition.shape[0]
 
-    # Initialize latent state (use first observation to initialize)
-    # This is a simple initialization; could be learned or use a prior
-    z_init = jnp.zeros((batch_size, model.latent_dim))
+    # Split keys for each batch element
+    keys = jax.random.split(key, batch_size)
 
-    # Compute ELBO
-    loss_components = model.elbo(
-        observations=observations,
-        times=times,
-        z_init=z_init,
-        condition=condition,
-        key=key,
+    # Compute ELBO for each sequence using vmap
+    # model.elbo expects: obs (T, obs_dim), times (T,), condition (condition_dim,), key
+    # Return tuple instead of LossComponents for vmap compatibility
+    def elbo_as_tuple(obs, t, cond, k):
+        lc = model.elbo(obs=obs, times=t, condition=cond, key=k)
+        return (lc.elbo, lc.reconstruction_loss, lc.kl_divergence, lc.flow_1_to_2_loss, lc.flow_2_to_1_loss)
+
+    results = jax.vmap(elbo_as_tuple)(observations, times, condition, keys)
+    elbo_batch, recon_batch, kl_batch, flow12_batch, flow21_batch = results
+
+    # Average over batch
+    avg_loss_components = LossComponents(
+        elbo=elbo_batch.mean(),
+        reconstruction_loss=recon_batch.mean(),
+        kl_divergence=kl_batch.mean(),
+        flow_1_to_2_loss=flow12_batch.mean(),
+        flow_2_to_1_loss=flow21_batch.mean(),
     )
 
     # Total loss with weighted KL
     total_loss = (
-        loss_components.reconstruction_loss
-        + kl_weight * loss_components.kl_divergence
+        avg_loss_components.reconstruction_loss
+        + kl_weight * avg_loss_components.kl_divergence
     )
 
-    return total_loss, loss_components
+    return total_loss, avg_loss_components
 
 
 def train(cfg: TrainConfig):
@@ -313,10 +325,10 @@ def train(cfg: TrainConfig):
 
     # Training step
     @eqx.filter_value_and_grad(has_aux=True)
-    def loss_fn(params, batch, key):
+    def loss_fn(params, batch, key, current_kl_weight):
         m = eqx.combine(params, model)
         total_loss, loss_components = compute_elbo_loss(
-            m, batch, key, cfg.kl_weight
+            m, batch, key, current_kl_weight
         )
         # Add flow loss
         total_loss = total_loss + cfg.flow_loss_weight * (
@@ -329,21 +341,22 @@ def train(cfg: TrainConfig):
             "elbo": loss_components.elbo,
             "flow_1_to_2_loss": loss_components.flow_1_to_2_loss,
             "flow_2_to_1_loss": loss_components.flow_2_to_1_loss,
+            "kl_weight": current_kl_weight,
         }
         return total_loss, metrics
 
     @eqx.filter_jit
-    def train_step(params, opt_state, batch, key):
-        (loss_value, metrics), grads = loss_fn(params, batch, key)
+    def train_step(params, opt_state, batch, key, current_kl_weight):
+        (loss_value, metrics), grads = loss_fn(params, batch, key, current_kl_weight)
         updates, opt_state = optim.update(grads, opt_state, params)
         params = eqx.apply_updates(params, updates)
         return params, opt_state, metrics
 
     @eqx.filter_jit
-    def eval_step(params, batch, key):
+    def eval_step(params, batch, key, current_kl_weight):
         m = eqx.combine(params, model)
         total_loss, loss_components = compute_elbo_loss(
-            m, batch, key, cfg.kl_weight
+            m, batch, key, current_kl_weight
         )
         return {
             "total_loss": total_loss,
@@ -359,6 +372,14 @@ def train(cfg: TrainConfig):
 
     epoch_bar = tqdm(range(1, cfg.epochs + 1), desc="Epochs", dynamic_ncols=True)
     for epoch in epoch_bar:
+        # Calculate KL weight
+        if cfg.kl_anneal_epochs > 0:
+            # Linear annealing from 0 to cfg.kl_weight
+            progress = min(1.0, epoch / cfg.kl_anneal_epochs)
+            current_kl_weight = jnp.array(progress * cfg.kl_weight)
+        else:
+            current_kl_weight = jnp.array(cfg.kl_weight)
+
         # Training
         train_metrics_sum = None
         for step in range(steps_per_epoch):
@@ -366,7 +387,7 @@ def train(cfg: TrainConfig):
             batch = _as_batch_arrays(next(train_iter))
 
             params, opt_state, metrics = train_step(
-                params, opt_state, batch, step_key
+                params, opt_state, batch, step_key, current_kl_weight
             )
 
             if train_metrics_sum is None:
@@ -374,6 +395,7 @@ def train(cfg: TrainConfig):
             else:
                 for k, v in metrics.items():
                     train_metrics_sum[k] = train_metrics_sum[k] + jnp.array(v)
+
 
         # Average training metrics
         train_metrics = {k: float(v / steps_per_epoch) for k, v in train_metrics_sum.items()}
@@ -386,7 +408,7 @@ def train(cfg: TrainConfig):
         for batch in val_iter:
             key, val_key = jax.random.split(key)
             batch = _as_batch_arrays(batch)
-            metrics = eval_step(params, batch, val_key)
+            metrics = eval_step(params, batch, val_key, current_kl_weight)
 
             if val_metrics_sum is None:
                 val_metrics_sum = {k: jnp.array(v) for k, v in metrics.items()}
@@ -405,6 +427,7 @@ def train(cfg: TrainConfig):
             "train_loss": f"{train_metrics['total_loss']:.4f}",
             "val_loss": f"{val_metrics['total_loss']:.4f}",
             "elbo": f"{val_metrics['elbo']:.4f}",
+            "kl_w": f"{current_kl_weight:.2f}",
         })
 
         # Logging
@@ -413,6 +436,8 @@ def train(cfg: TrainConfig):
                 {
                     **{f"train/{k}": v for k, v in train_metrics.items()},
                     **{f"val/{k}": v for k, v in val_metrics.items()},
+                    "kl_weight": current_kl_weight,
+                    "epoch": epoch,
                 },
                 step=epoch,
             )
@@ -457,6 +482,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--encoder-embedding-dim", type=int, default=None)
     p.add_argument("--encoder-hidden-size", type=int, default=None)
     p.add_argument("--encoder-depth", type=int, default=None)
+    p.add_argument("--encoder-type", type=str, choices=["mlp", "identity"], default=None)
     p.add_argument("--posterior-type", type=str, choices=["mlp", "mlp_residual", "gru"], default=None)
     p.add_argument("--posterior-hidden-size", type=int, default=None)
     p.add_argument("--posterior-depth", type=int, default=None)
@@ -480,6 +506,7 @@ def parse_args() -> TrainConfig:
     # Loss weights
     p.add_argument("--flow-loss-weight", type=float, default=None)
     p.add_argument("--kl-weight", type=float, default=None)
+    p.add_argument("--kl-anneal-epochs", type=int, default=None)
 
     # Normalization
     p.add_argument("--standardize-condition", action="store_true", dest="standardize_condition")

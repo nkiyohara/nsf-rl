@@ -132,35 +132,50 @@ class MultivariateNormalDiagStochasticFlow(StochasticFlow):
         condition: Optional[Float[Array, "..."]] = None,
     ) -> MultivariateNormalDiag:
         """Compute transition distribution."""
-        t_init = jnp.atleast_1d(t_init)
-        t_final = jnp.atleast_1d(t_final)
+        # Ensure time variables are arrays, but preserve scalar shape
+        t_init = jnp.asarray(t_init)
+        t_final = jnp.asarray(t_final)
+        time_diff = t_final - t_init
 
-        time_diff = (t_final - t_init)[..., None]
+        # Handle scalar vs batched inputs
+        # x_init shape: (state_dim,) for scalar, (batch, state_dim) for batched
+        is_scalar = x_init.ndim == 1
+
+        if is_scalar:
+            # Scalar case: time_diff is scalar, expand to (1,) for concat
+            time_diff_expanded = time_diff[None]  # (1,)
+            t_init_expanded = t_init[None] if not self.autonomous else None
+        else:
+            # Batched case: time_diff should be (batch,), expand to (batch, 1)
+            time_diff_expanded = time_diff[..., None]  # (..., 1)
+            t_init_expanded = t_init[..., None] if not self.autonomous else None
 
         # Build input features
         if self.autonomous:
-            inputs = [x_init, time_diff]
+            inputs = [x_init, time_diff_expanded]
         else:
-            inputs = [x_init, time_diff, t_init[..., None]]
+            inputs = [x_init, time_diff_expanded, t_init_expanded]
 
         if condition is not None:
             inputs.append(condition)
 
         features = jnp.concatenate(inputs, axis=-1)
 
-        # Handle batched inputs
-        batch_shape = features.shape[:-1]
-        flat_features = features.reshape((-1, features.shape[-1]))
-        params = jax.vmap(self.net)(flat_features)
-        params = params.reshape(batch_shape + (2 * self.state_dim,))
+        # Process through network
+        if is_scalar:
+            # Single sample: apply network directly
+            params = self.net(features)
+        else:
+            # Batched: use vmap
+            params = jax.vmap(self.net)(features)
 
         mean_shift, raw_scale = jnp.split(params, 2, axis=-1)
 
         # Mean: x_init + shift * Δt (linear interpolation baseline)
-        mean = x_init + mean_shift * time_diff
+        mean = x_init + mean_shift * time_diff_expanded
 
         # Scale: proportional to sqrt(Δt) (Brownian motion scaling)
-        scale = (self.scale_fn(raw_scale) + self.eps) * jnp.sqrt(jnp.maximum(time_diff, self.eps))
+        scale = (self.scale_fn(raw_scale) + self.eps) * jnp.sqrt(jnp.maximum(time_diff_expanded, self.eps))
 
         return MultivariateNormalDiag(loc=mean, scale_diag=scale)
 
@@ -269,23 +284,32 @@ class AffineCouplingStochasticFlow(StochasticFlow):
         condition: Optional[Float[Array, "..."]] = None,
     ) -> ContinuousNormalizingFlow:
         """Compute transition distribution with normalizing flow."""
-        t_init = jnp.atleast_1d(t_init)
-        t_final = jnp.atleast_1d(t_final)
+        # Ensure time variables are arrays
+        t_init = jnp.asarray(t_init)
+        t_final = jnp.asarray(t_final)
 
         # Get base distribution
         base_dist = self.base_flow(x_init, t_init, t_final, condition)
 
         time_diff = t_final - t_init
 
+        # Handle scalar vs batched inputs
+        is_scalar = x_init.ndim == 1
+
+        if is_scalar:
+            # Scalar case: expand time to (1,) for concat
+            time_diff_expanded = time_diff[None]
+            t_init_expanded = t_init[None] if not self.autonomous else None
+        else:
+            # Batched case: expand time to (..., 1) for concat
+            time_diff_expanded = time_diff[..., None]
+            t_init_expanded = t_init[..., None] if not self.autonomous else None
+
         # Build flow condition
         if self.autonomous:
-            flow_condition_parts = [x_init, jnp.expand_dims(time_diff, axis=-1)]
+            flow_condition_parts = [x_init, time_diff_expanded]
         else:
-            flow_condition_parts = [
-                x_init,
-                jnp.expand_dims(time_diff, axis=-1),
-                jnp.expand_dims(t_init, axis=-1),
-            ]
+            flow_condition_parts = [x_init, time_diff_expanded, t_init_expanded]
 
         if condition is not None:
             flow_condition_parts.append(condition)

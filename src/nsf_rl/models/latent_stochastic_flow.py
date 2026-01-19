@@ -289,29 +289,25 @@ class LatentStochasticFlow(eqx.Module):
 
     def elbo(
         self,
-        observations: list[Union[ObservationBase, Float[Array, "batch obs_dim"]]],
-        times: Float[Array, "batch T"],
-        z_init: Float[Array, "batch latent_dim"],
-        condition: Optional[Float[Array, "batch condition_dim"]] = None,
+        obs: Float[Array, "T obs_dim"],
+        times: Float[Array, "T"],
+        condition: Optional[Float[Array, "condition_dim"]] = None,
         key: Optional[PRNGKeyArray] = None,
-        n_samples: int = 1,
     ) -> LossComponents:
-        """Compute the Evidence Lower Bound (ELBO).
+        """Compute the Evidence Lower Bound (ELBO) for a single sequence.
 
         ELBO = E_q[log p(obs|z)] - D_KL(q(z|obs) || p(z|z_prev))
 
-        This method properly handles:
-        - time_diff computation between consecutive observations
-        - PosteriorCarry propagation for GRU posteriors
-        - Condition routing to encoder, posterior, and flow
+        This method:
+        - Takes a SINGLE sequence (no batch dimension)
+        - Uses lax.scan for time steps
+        - Batch processing should be done externally with jax.vmap
 
         Args:
-            observations: List of T observations.
-            times: Time array of shape (batch, T) in seconds.
-            z_init: Initial latent state.
-            condition: Optional conditioning vector.
+            obs: Observations of shape (T, obs_dim).
+            times: Time array of shape (T,) in seconds.
+            condition: Optional conditioning vector of shape (condition_dim,).
             key: PRNG key for sampling.
-            n_samples: Number of samples for Monte Carlo estimation.
 
         Returns:
             LossComponents containing ELBO and its components.
@@ -319,138 +315,116 @@ class LatentStochasticFlow(eqx.Module):
         if key is None:
             key = jax.random.PRNGKey(0)
 
-        batch_size = z_init.shape[0]
-        T = len(observations)
+        T = obs.shape[0]
 
-        # Process each batch element independently to handle GRU carry
-        def process_single_trajectory(
-            obs_sequence: list[Float[Array, "obs_dim"]],
-            time_sequence: Float[Array, "T"],
-            z_init_single: Float[Array, "latent_dim"],
-            condition_single: Optional[Float[Array, "condition_dim"]],
-            key_single: PRNGKeyArray,
-        ) -> tuple[Float[Array, ""], Float[Array, ""], Float[Array, ""], Float[Array, ""], Float[Array, ""]]:
-            """Process a single trajectory."""
-            total_reconstruction = jnp.zeros(())
-            total_kl = jnp.zeros(())
-            total_flow_1_to_2 = jnp.zeros(())
-            total_flow_2_to_1 = jnp.zeros(())
+        # Encode all observations at once
+        # obs_embeddings: (T, embedding_dim)
+        obs_embeddings = jax.vmap(lambda o: self.encode(o, condition))(obs)
 
-            z_current = z_init_single
-            t_current = time_sequence[0]
-            posterior_carry: Optional[PosteriorCarry] = None
+        # Initial state: prior at t=0
+        z_init = jnp.zeros(self.latent_dim)
+        prior_dist_0 = MultivariateNormalDiag(
+            loc=z_init,
+            scale_diag=jnp.ones(self.latent_dim) * 0.1,
+        )
 
-            for i in range(T):
-                key_single, sample_key, flow_key = jax.random.split(key_single, 3)
+        # Initialize posterior carry
+        posterior_carry: Optional[PosteriorCarry] = None
 
-                obs = obs_sequence[i]
-                t_next = time_sequence[i]
+        # Process t=0
+        key, sample_key = jax.random.split(key)
+        posterior_dist_0, posterior_carry = self.infer_posterior_step(
+            embedding=obs_embeddings[0],
+            prior=prior_dist_0,
+            time=times[0],
+            prior_initial_state=z_init,
+            time_diff=jnp.array(-1.0),  # Sentinel for first step
+            condition=condition,
+            carry=posterior_carry,
+        )
 
-                # Compute time_diff (elapsed time since previous observation)
-                if i == 0:
-                    time_diff = jnp.array(-1.0)  # Sentinel for first step
-                else:
-                    time_diff = t_next - t_current
+        z_sample_0 = posterior_dist_0.sample(sample_key)
+        kl_0 = compute_kl_divergence(posterior_dist_0, prior_dist_0, z_sample_0)
 
-                # Get prior from flow
-                if i == 0:
-                    # First step: prior is centered at initial state
-                    prior = MultivariateNormalDiag(
-                        loc=z_current,
-                        scale_diag=jnp.ones_like(z_current) * 0.1,
-                    )
-                else:
-                    prior = self.get_prior(z_current, t_current, t_next, condition_single)
+        # Reconstruction at t=0
+        obs_dist_0 = self.decode(z_sample_0, condition)
+        reconstruction_0 = obs_dist_0.log_prob(obs[0])
 
-                # Encode observation
-                embedding = self.encode(obs, condition_single)
+        # Prepare carry for scan: (z_current, t_current, posterior_carry, key)
+        initial_carry = (z_sample_0, times[0], posterior_carry, key)
 
-                # Get posterior using step() with time_diff
-                posterior, posterior_carry = self.infer_posterior_step(
-                    embedding=embedding,
-                    prior=prior,
-                    time=t_next,
-                    prior_initial_state=z_current,
-                    time_diff=time_diff,
-                    condition=condition_single,
-                    carry=posterior_carry,
-                )
+        # Define scan body for t=1 to T-1
+        def scan_body(carry, x):
+            """One scan step: flow -> posterior -> sample -> reconstruct."""
+            z_current, t_current, posterior_carry, key = carry
+            t_next, emb_next, obs_next = x
 
-                # Sample from posterior
-                z_sample = posterior.sample(sample_key)
+            key, sample_key, flow_key = jax.random.split(key, 3)
 
-                # Reconstruction loss: E_q[log p(obs|z)]
-                obs_dist = self.decode(z_sample, condition_single)
-                if isinstance(obs, ObservationBase):
-                    obs_value = obs.value
-                else:
-                    obs_value = obs
-                reconstruction = obs_dist.log_prob(obs_value)
+            # Time difference
+            time_diff = t_next - t_current
 
-                # KL divergence: D_KL(q || p)
-                # Uses analytical KL for Gaussian-Gaussian, Monte Carlo otherwise
-                # For Affine Coupling flows (ContinuousNormalizingFlow prior),
-                # we use KL to base distribution as approximation
-                kl = compute_kl_divergence(posterior, prior, z_sample)
+            # Prior from flow
+            prior = self.get_prior(z_current, t_current, t_next, condition)
 
-                total_reconstruction = total_reconstruction + reconstruction
-                total_kl = total_kl + kl
-
-                # Flow consistency losses (for t > 0)
-                if i > 0:
-                    flow_1_to_2, flow_2_to_1 = self._flow_losses_single(
-                        z_prev=z_current,
-                        z_curr=z_sample,
-                        t_prev=t_current,
-                        t_curr=t_next,
-                        condition=condition_single,
-                        key=flow_key,
-                    )
-                    total_flow_1_to_2 = total_flow_1_to_2 + flow_1_to_2
-                    total_flow_2_to_1 = total_flow_2_to_1 + flow_2_to_1
-
-                z_current = z_sample
-                t_current = t_next
-
-            return (
-                total_reconstruction,
-                total_kl,
-                total_flow_1_to_2,
-                total_flow_2_to_1,
-                jnp.array(T, dtype=jnp.float32),
+            # Posterior
+            posterior, posterior_carry_next = self.infer_posterior_step(
+                embedding=emb_next,
+                prior=prior,
+                time=t_next,
+                prior_initial_state=z_current,
+                time_diff=time_diff,
+                condition=condition,
+                carry=posterior_carry,
             )
 
-        # Batch processing
-        keys = jax.random.split(key, batch_size)
+            # Sample
+            z_sample = posterior.sample(sample_key)
 
-        # Stack observations into arrays for vmap
-        obs_stacked = jnp.stack(observations, axis=1)  # [batch, T, obs_dim]
+            # KL divergence
+            kl = compute_kl_divergence(posterior, prior, z_sample)
 
-        # vmap over batch dimension
-        def process_batch_elem(i: int):
-            obs_seq = [obs_stacked[i, t] for t in range(T)]
-            cond = condition[i] if condition is not None else None
-            return process_single_trajectory(
-                obs_seq, times[i], z_init[i], cond, keys[i]
+            # Reconstruction
+            obs_dist = self.decode(z_sample, condition)
+            reconstruction = obs_dist.log_prob(obs_next)
+
+            # Flow consistency losses
+            flow_1_to_2, flow_2_to_1 = self._flow_losses_single(
+                z_prev=z_current,
+                z_curr=z_sample,
+                t_prev=t_current,
+                t_curr=t_next,
+                condition=condition,
+                key=flow_key,
             )
 
-        # Use lax.scan or simple loop for batching
-        results = jax.vmap(
-            lambda i: process_batch_elem(i)
-        )(jnp.arange(batch_size))
+            new_carry = (z_sample, t_next, posterior_carry_next, key)
+            outputs = (kl, reconstruction, flow_1_to_2, flow_2_to_1, z_sample)
 
-        total_reconstruction, total_kl, total_flow_1_to_2, total_flow_2_to_1, _ = results
+            return new_carry, outputs
 
-        # Average over batch and time
-        avg_reconstruction = total_reconstruction.mean() / T
-        avg_kl = total_kl.mean() / T
-        avg_flow_1_to_2 = total_flow_1_to_2.mean() / max(T - 1, 1)
-        avg_flow_2_to_1 = total_flow_2_to_1.mean() / max(T - 1, 1)
+        # Scan over t=1 to T-1
+        scan_inputs = (times[1:], obs_embeddings[1:], obs[1:])
+        _, scan_outputs = jax.lax.scan(scan_body, initial_carry, scan_inputs)
 
-        elbo = avg_reconstruction - avg_kl
+        kl_terms, reconstructions, flow_1_to_2_terms, flow_2_to_1_terms, z_samples = scan_outputs
+
+        # Combine t=0 with scanned results
+        total_kl = kl_0 + jnp.sum(kl_terms)
+        total_reconstruction = reconstruction_0 + jnp.sum(reconstructions)
+        total_flow_1_to_2 = jnp.sum(flow_1_to_2_terms)
+        total_flow_2_to_1 = jnp.sum(flow_2_to_1_terms)
+
+        # Average over time
+        avg_reconstruction = total_reconstruction / T
+        avg_kl = total_kl / T
+        avg_flow_1_to_2 = total_flow_1_to_2 / max(T - 1, 1)
+        avg_flow_2_to_1 = total_flow_2_to_1 / max(T - 1, 1)
+
+        elbo_value = avg_reconstruction - avg_kl
 
         return LossComponents(
-            elbo=elbo,
+            elbo=elbo_value,
             reconstruction_loss=-avg_reconstruction,
             kl_divergence=avg_kl,
             flow_1_to_2_loss=avg_flow_1_to_2,
@@ -587,6 +561,7 @@ def build_latent_stochastic_flow(
     encoder_embedding_dim: int = 64,
     encoder_hidden_size: int = 64,
     encoder_depth: int = 2,
+    encoder_type: Literal["mlp", "identity"] = "mlp",
     posterior_type: Literal["mlp", "mlp_residual", "gru"] = "gru",
     posterior_hidden_size: int = 64,
     posterior_depth: int = 2,
@@ -640,7 +615,7 @@ def build_latent_stochastic_flow(
         MultivariateNormalDiagBridgeModel,
     )
     from nsf_rl.models.decoders import MLPMultivariateNormalDiagDecoder
-    from nsf_rl.models.encoders import MLPEncoder
+    from nsf_rl.models.encoders import MLPEncoder, IdentityEncoder
     from nsf_rl.models.posteriors import (
         GRUResidualPosterior,
         MLPPosterior,
@@ -653,16 +628,26 @@ def build_latent_stochastic_flow(
 
     keys = jax.random.split(key, 5)
 
-    # Encoder
-    encoder_condition_dim = condition_dim if use_condition_in_encoder else 0
-    encoder = MLPEncoder(
-        obs_dim=obs_dim,
-        embedding_dim=encoder_embedding_dim,
-        condition_dim=encoder_condition_dim,
-        hidden_size=encoder_hidden_size,
-        depth=encoder_depth,
-        key=keys[0],
-    )
+    if encoder_type == "identity":
+        # Identity encoder: pass observations through
+        # We force use_condition_in_encoder=False to avoid duplication
+        # (condition will be added in posterior)
+        use_condition_in_encoder = False
+        encoder_embedding_dim = obs_dim
+        encoder = IdentityEncoder()
+    elif encoder_type == "mlp":
+        # MLP encoder
+        encoder_condition_dim = condition_dim if use_condition_in_encoder else 0
+        encoder = MLPEncoder(
+            obs_dim=obs_dim,
+            embedding_dim=encoder_embedding_dim,
+            condition_dim=encoder_condition_dim,
+            hidden_size=encoder_hidden_size,
+            depth=encoder_depth,
+            key=keys[0],
+        )
+    else:
+        raise ValueError(f"Unknown encoder type: {encoder_type}")
 
     # Posterior (always receives condition)
     if posterior_type == "mlp":

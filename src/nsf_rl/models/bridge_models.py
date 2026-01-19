@@ -123,22 +123,43 @@ class MultivariateNormalDiagBridgeModel(BridgeModel):
         condition: Optional[Float[Array, "..."]] = None,
     ) -> MultivariateNormalDiag:
         """Compute bridge distribution at time t."""
-        t_init = jnp.atleast_1d(t_init)
-        t_final = jnp.atleast_1d(t_final)
-        t = jnp.atleast_1d(t)
+        # Ensure time variables are arrays
+        t_init = jnp.asarray(t_init)
+        t_final = jnp.asarray(t_final)
+        t = jnp.asarray(t)
 
-        # Time features
-        dt_init = (t - t_init)[..., None]  # time since init
-        dt_final = (t_final - t)[..., None]  # time until final
-        dt_total = (t_final - t_init)[..., None]  # total interval
+        # Time differences
+        dt_init = t - t_init  # time since init
+        dt_final = t_final - t  # time until final
+        dt_total = t_final - t_init  # total interval
 
-        # Build input
-        if self.autonomous:
-            time_features = jnp.concatenate([dt_init, dt_final, dt_total], axis=-1)
+        # Handle scalar vs batched inputs
+        is_scalar = x_init.ndim == 1
+
+        if is_scalar:
+            # Scalar: expand time features to (3,) or (4,)
+            if self.autonomous:
+                time_features = jnp.array([dt_init, dt_final, dt_total])
+            else:
+                time_features = jnp.array([dt_init, dt_final, dt_total, t_init])
+            # Expand for later computations
+            dt_init_expanded = dt_init
+            dt_final_expanded = dt_final
+            dt_total_expanded = dt_total
         else:
-            time_features = jnp.concatenate(
-                [dt_init, dt_final, dt_total, t_init[..., None]], axis=-1
-            )
+            # Batched: expand time to (..., 1) for concat
+            dt_init_exp = dt_init[..., None]
+            dt_final_exp = dt_final[..., None]
+            dt_total_exp = dt_total[..., None]
+            if self.autonomous:
+                time_features = jnp.concatenate([dt_init_exp, dt_final_exp, dt_total_exp], axis=-1)
+            else:
+                time_features = jnp.concatenate(
+                    [dt_init_exp, dt_final_exp, dt_total_exp, t_init[..., None]], axis=-1
+                )
+            dt_init_expanded = dt_init_exp
+            dt_final_expanded = dt_final_exp
+            dt_total_expanded = dt_total_exp
 
         inputs = [x_init, x_final, time_features]
         if condition is not None:
@@ -146,24 +167,31 @@ class MultivariateNormalDiagBridgeModel(BridgeModel):
 
         features = jnp.concatenate(inputs, axis=-1)
 
-        # Handle batched inputs
-        batch_shape = features.shape[:-1]
-        flat_features = features.reshape((-1, features.shape[-1]))
-        params = jax.vmap(self.net)(flat_features)
-        params = params.reshape(batch_shape + (2 * self.state_dim,))
+        # Process through network
+        if is_scalar:
+            params = self.net(features)
+        else:
+            params = jax.vmap(self.net)(features)
 
         mean_shift, raw_scale = jnp.split(params, 2, axis=-1)
 
         # Linear interpolation baseline
-        ratio = dt_init / jnp.maximum(dt_total, self.eps)
-        base_mean = x_init + ratio * (x_final - x_init)
-
-        # Add learned correction
-        mean = base_mean + mean_shift * dt_init * dt_final / jnp.maximum(dt_total, self.eps)
-
-        # Scale proportional to geometric mean of time intervals
-        scale = jax.nn.softplus(raw_scale) + self.eps
-        scale = scale * jnp.sqrt(dt_init * dt_final / jnp.maximum(dt_total, self.eps) + self.eps)
+        if is_scalar:
+            ratio = dt_init / jnp.maximum(dt_total, self.eps)
+            base_mean = x_init + ratio * (x_final - x_init)
+            # Add learned correction
+            mean = base_mean + mean_shift * dt_init * dt_final / jnp.maximum(dt_total, self.eps)
+            # Scale proportional to geometric mean of time intervals
+            scale = jax.nn.softplus(raw_scale) + self.eps
+            scale = scale * jnp.sqrt(dt_init * dt_final / jnp.maximum(dt_total, self.eps) + self.eps)
+        else:
+            ratio = dt_init_expanded / jnp.maximum(dt_total_expanded, self.eps)
+            base_mean = x_init + ratio * (x_final - x_init)
+            # Add learned correction
+            mean = base_mean + mean_shift * dt_init_expanded * dt_final_expanded / jnp.maximum(dt_total_expanded, self.eps)
+            # Scale proportional to geometric mean of time intervals
+            scale = jax.nn.softplus(raw_scale) + self.eps
+            scale = scale * jnp.sqrt(dt_init_expanded * dt_final_expanded / jnp.maximum(dt_total_expanded, self.eps) + self.eps)
 
         return MultivariateNormalDiag(loc=mean, scale_diag=scale)
 
@@ -262,34 +290,51 @@ class AffineCouplingBridgeModel(BridgeModel):
         condition: Optional[Float[Array, "..."]] = None,
     ) -> ContinuousNormalizingFlow:
         """Compute bridge distribution with normalizing flow."""
-        t_init = jnp.atleast_1d(t_init)
-        t_final = jnp.atleast_1d(t_final)
-        t = jnp.atleast_1d(t)
+        # Ensure time variables are arrays
+        t_init = jnp.asarray(t_init)
+        t_final = jnp.asarray(t_final)
+        t = jnp.asarray(t)
 
         # Get base distribution
         base_dist = self.base_bridge(x_init, t_init, x_final, t_final, t, condition)
 
-        # Time features for flow condition
-        dt_init = (t - t_init)[..., None]
-        dt_final = (t_final - t)[..., None]
-        dt_total = (t_final - t_init)[..., None]
+        # Time differences
+        dt_init = t - t_init
+        dt_final = t_final - t
+        dt_total = t_final - t_init
 
-        if self.autonomous:
-            time_features = jnp.concatenate([dt_init, dt_final, dt_total], axis=-1)
+        # Handle scalar vs batched inputs
+        is_scalar = x_init.ndim == 1
+
+        if is_scalar:
+            # Scalar: create (3,) or (4,) time features
+            if self.autonomous:
+                time_features = jnp.array([dt_init, dt_final, dt_total])
+            else:
+                time_features = jnp.array([dt_init, dt_final, dt_total, t_init])
+            # Time scaling factor
+            alpha = dt_init / jnp.maximum(dt_total, 1e-6)
+            time_scale = jnp.clip(alpha * (1.0 - alpha), a_min=0.0)
         else:
-            time_features = jnp.concatenate(
-                [dt_init, dt_final, dt_total, t_init[..., None]], axis=-1
-            )
+            # Batched: expand time to (..., 1) for concat
+            dt_init_exp = dt_init[..., None]
+            dt_final_exp = dt_final[..., None]
+            dt_total_exp = dt_total[..., None]
+            if self.autonomous:
+                time_features = jnp.concatenate([dt_init_exp, dt_final_exp, dt_total_exp], axis=-1)
+            else:
+                time_features = jnp.concatenate(
+                    [dt_init_exp, dt_final_exp, dt_total_exp, t_init[..., None]], axis=-1
+                )
+            # Time scaling factor
+            alpha = dt_init_exp / jnp.maximum(dt_total_exp, 1e-6)
+            time_scale = jnp.clip(alpha * (1.0 - alpha), a_min=0.0).squeeze(-1)
 
         flow_condition_parts = [x_init, x_final, time_features]
         if condition is not None:
             flow_condition_parts.append(condition)
 
         flow_condition = jnp.concatenate(flow_condition_parts, axis=-1)
-
-        # Time scaling factor: α(1-α) where α = (t - t_init) / (t_final - t_init)
-        alpha = dt_init / jnp.maximum(dt_total, 1e-6)
-        time_scale = jnp.clip(alpha * (1.0 - alpha), a_min=0.0).squeeze(-1)
 
         return ContinuousNormalizingFlow(
             base_distribution=base_dist,

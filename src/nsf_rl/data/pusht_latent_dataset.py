@@ -53,14 +53,14 @@ class SequenceBatch:
     """A batch of sequences for training Latent NSF.
 
     Attributes:
-        observations: List of T observation arrays, each [batch, obs_dim].
+        observations: Observation arrays [batch, T, obs_dim].
         full_states: Full state arrays [batch, T, state_dim] for supervision.
         times: Time array [batch, T] in seconds.
         condition: Condition array [batch, condition_dim].
         z_init: Initial latent state [batch, latent_dim] (if available).
     """
 
-    observations: list[np.ndarray]  # List of [B, obs_dim]
+    observations: np.ndarray  # [B, T, obs_dim]
     full_states: np.ndarray  # [B, T, state_dim]
     times: np.ndarray  # [B, T]
     condition: np.ndarray  # [B, C]
@@ -409,12 +409,8 @@ class PushTLatentDataset:
                 times_batch = np.stack(time_sequences, axis=0)  # [B, T]
                 cond_batch = np.stack(conditions, axis=0)  # [B, cond_dim]
 
-                # Convert observations to list for model input
-                # List of T arrays, each [B, obs_dim]
-                obs_list = [obs_batch[:, t, :] for t in range(self.seq_len)]
-
                 yield SequenceBatch(
-                    observations=obs_list,
+                    observations=obs_batch,  # [B, T, obs_dim] - array, not list
                     full_states=states_batch,
                     times=times_batch,
                     condition=cond_batch,
